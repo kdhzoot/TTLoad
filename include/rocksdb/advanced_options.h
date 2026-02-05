@@ -741,7 +741,7 @@ struct AdvancedColumnFamilyOptions {
   // compaction. For universal compaction, dynamically changing this option has
   // no effect, users should dynamically change `periodic_compaction_seconds`
   // instead.
-  uint64_t ttl = 0xfffffffffffffffe;
+  uint64_t ttl = 315360000; // 10 years
 
   // This option has different meanings for different compaction styles:
   //
