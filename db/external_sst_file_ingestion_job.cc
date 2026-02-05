@@ -33,13 +33,18 @@ Status ExternalSstFileIngestionJob::Prepare(
     SuperVersion* sv) {
   Status status;
 
-  // Read the information of files we are ingesting
+  uint64_t current_file_number = next_file_number;
   for (const std::string& file_path : external_files_paths) {
     IngestedFileInfo file_to_ingest;
-    // For temperature, first assume it matches provided hint
     file_to_ingest.file_temperature = file_temperature;
+    
+    uint64_t file_number_from_path = TableFileNameToNumber(file_path);
+    uint64_t file_number_to_use = (file_number_from_path > 0) 
+                                  ? file_number_from_path 
+                                  : current_file_number++;
+    
     status =
-        GetIngestedFileInfo(file_path, next_file_number++, &file_to_ingest, sv);
+        GetIngestedFileInfo(file_path, file_number_to_use, &file_to_ingest, sv);
     if (!status.ok()) {
       return status;
     }
@@ -113,6 +118,39 @@ Status ExternalSstFileIngestionJob::Prepare(
     const std::string path_outside_db = f.external_file_path;
     const std::string path_inside_db = TableFileName(
         cfd_->ioptions()->cf_paths, f.fd.GetNumber(), f.fd.GetPathId());
+
+    // If file is already in DB path, skip copy/move
+    if (path_outside_db == path_inside_db) {
+      // File is already in the correct location, just sync it
+      f.copy_file = false;
+      f.internal_file_path = path_inside_db;
+      std::unique_ptr<FSWritableFile> file_to_sync;
+      FileOptions reopen_options = env_options_;
+      reopen_options.use_direct_writes =
+          db_options_.use_direct_io_for_flush_and_compaction;
+      Status s = fs_->ReopenWritableFile(path_inside_db, reopen_options,
+                                         &file_to_sync, nullptr);
+      if (s.IsNotSupported()) {
+        // File system doesn't support reopening, skip sync
+        status = Status::OK();
+      } else if (s.ok()) {
+        TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncIngestedFile");
+        status = SyncIngestedFile(file_to_sync.get());
+        TEST_SYNC_POINT("ExternalSstFileIngestionJob::AfterSyncIngestedFile");
+        if (!status.ok()) {
+          ROCKS_LOG_WARN(db_options_.info_log,
+                         "Failed to sync ingested file %s: %s",
+                         path_inside_db.c_str(), status.ToString().c_str());
+        }
+      } else {
+        status = s;
+      }
+      if (status.ok()) {
+        ingestion_path_ids.insert(f.fd.GetPathId());
+      }
+      continue;
+    }
+
     if (ingestion_options_.move_files) {
       assert(!ingestion_options_.allow_db_generated_files);
       status =
@@ -398,9 +436,43 @@ Status ExternalSstFileIngestionJob::Run() {
   edit_.SetColumnFamily(cfd_->GetID());
   // The levels that the files will be ingested into
 
+  // For S3 mode, track files already processed in this batch to check for overlaps
+  // within the same batch (same level files must not overlap)
+  std::vector<std::pair<InternalKey, InternalKey>> processed_file_ranges;
+  if (ingestion_options_.s3_ingest && ingestion_options_.s3_target_level > 0) {
+    processed_file_ranges.reserve(files_to_ingest_.size());
+  }
+
   for (IngestedFileInfo& f : files_to_ingest_) {
     SequenceNumber assigned_seqno = 0;
-    if (ingestion_options_.ingest_behind) {
+
+    if (ingestion_options_.s3_ingest) {  // - S3 ingestion mode (Destination Level)
+      if (ingestion_options_.s3_target_level > 0) {
+        const Comparator* ucmp = cfd_->internal_comparator().user_comparator();
+        for (const auto& processed_range : processed_file_ranges) {
+          if (sstableKeyCompare(ucmp, f.largest_internal_key,
+                                processed_range.first) >= 0 ||
+              sstableKeyCompare(ucmp, processed_range.second,
+                                f.smallest_internal_key) >= 0) {
+            ROCKS_LOG_WARN(
+                db_options_.info_log,
+                "S3 Ingestion: OVERLAP in same batch! File (min=%s, max=%s) "
+                "overlaps with previously processed file (min=%s, max=%s) in "
+                "level %d",
+                f.smallest_internal_key.DebugString(true).c_str(),
+                f.largest_internal_key.DebugString(true).c_str(),
+                processed_range.first.DebugString(true).c_str(),
+                processed_range.second.DebugString(true).c_str(),
+                ingestion_options_.s3_target_level);
+          }
+        }
+      }
+
+      // S3 ingestion mode: ingest to specified target level
+      status = CheckLevelForS3IngestedFile(super_version, &f,
+                                           ingestion_options_.s3_target_level,
+                                           last_seqno, &assigned_seqno);
+    } else if (ingestion_options_.ingest_behind) {
       status = CheckLevelForIngestedBehindFile(&f);
     } else {
       status = AssignLevelAndSeqnoForIngestedFile(
@@ -480,7 +552,28 @@ Status ExternalSstFileIngestionJob::Run() {
         f.file_checksum, f.file_checksum_func_name, f.unique_id, 0, tail_size,
         f.user_defined_timestamps_persisted);
     f_metadata.temperature = f.file_temperature;
+
+    // Debug: 실제 삽입되는 파일의 키 범위 출력
+    if (ingestion_options_.s3_ingest) {
+      ROCKS_LOG_WARN(
+          db_options_.info_log,
+          "S3 Ingestion: Adding file #%lu to level %d - smallest=%s, "
+          "largest=%s, seqno=%lu",
+          f_metadata.fd.GetNumber(), f.picked_level,
+          f_metadata.smallest.DebugString(true).c_str(),
+          f_metadata.largest.DebugString(true).c_str(),
+          f_metadata.fd.smallest_seqno);
+    }
+
     edit_.AddFile(f.picked_level, f_metadata);
+
+    // Track processed file for overlap checking in same batch
+    if (ingestion_options_.s3_ingest &&
+        ingestion_options_.s3_target_level > 0 &&
+        f.picked_level == ingestion_options_.s3_target_level) {
+      processed_file_ranges.emplace_back(f.smallest_internal_key,
+                                         f.largest_internal_key);
+    }
   }
 
   CreateEquivalentFileIngestingCompactions();
@@ -1234,6 +1327,76 @@ bool ExternalSstFileIngestionJob::IngestedFileFitInLevel(
 
   // File did not overlap with level files, nor compaction output
   return true;
+}
+
+Status ExternalSstFileIngestionJob::CheckLevelForS3IngestedFile(
+    SuperVersion* sv, IngestedFileInfo* file_to_ingest, int target_level,
+    [[maybe_unused]] SequenceNumber last_seqno,
+    SequenceNumber* assigned_seqno) {
+  *assigned_seqno = 0;
+
+  // Validate target level
+  if (target_level < 0 || target_level >= cfd_->NumberLevels()) {
+    return Status::InvalidArgument("S3 target level is out of range. Valid range: 0 to " +
+                                  std::to_string(cfd_->NumberLevels() - 1));
+  }
+
+  auto* vstorage = cfd_->current()->storage_info();
+
+  // Check for overlaps with existing files in the SAME level only
+  // (Different levels can have overlapping key ranges)
+  bool overlap_with_level = false;
+  if (vstorage->NumLevelFiles(target_level) > 0) {
+    const std::vector<FileMetaData*>& existing_files =
+        vstorage->LevelFiles(target_level);
+    Slice file_smallest_user_key(file_to_ingest->start_ukey);
+    Slice file_largest_user_key(file_to_ingest->limit_ukey);
+    const Comparator* ucmp = cfd_->user_comparator();
+
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "S3 Ingestion: Checking overlap for file (min=%s, max=%s) with %zu "
+        "existing files in level %d",
+        file_to_ingest->smallest_internal_key.DebugString(true).c_str(),
+        file_to_ingest->largest_internal_key.DebugString(true).c_str(),
+        existing_files.size(), target_level);
+
+    for (const auto* existing_file : existing_files) {
+      Slice existing_smallest = existing_file->smallest.user_key();
+      Slice existing_largest = existing_file->largest.user_key();
+
+      bool overlaps = !(ucmp->CompareWithoutTimestamp(file_largest_user_key,
+                                                      existing_smallest) < 0 ||
+                        ucmp->CompareWithoutTimestamp(file_smallest_user_key,
+                                                      existing_largest) > 0);
+
+      if (overlaps) {
+        ROCKS_LOG_WARN(
+            db_options_.info_log,
+            "S3 Ingestion: OVERLAP detected in level %d! New file (min=%s, "
+            "max=%s) overlaps with existing file #%lu (min=%s, max=%s)",
+            target_level,
+            file_to_ingest->smallest_internal_key.DebugString(true).c_str(),
+            file_to_ingest->largest_internal_key.DebugString(true).c_str(),
+            existing_file->fd.GetNumber(),
+            existing_file->smallest.DebugString(true).c_str(),
+            existing_file->largest.DebugString(true).c_str());
+      }
+    }
+
+    Arena arena;
+    ReadOptions ro;
+    ro.total_order_seek = true;
+    Status status = sv->current->OverlapWithLevelIterator(
+        ro, env_options_, file_to_ingest->start_ukey,
+        file_to_ingest->limit_ukey, target_level, &overlap_with_level);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  file_to_ingest->picked_level = target_level;
+  return Status::OK();
 }
 
 template <typename TWritableFile>

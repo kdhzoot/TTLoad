@@ -146,6 +146,10 @@ std::string TableFileName(const std::vector<DbPath>& db_paths, uint64_t number,
   } else {
     path = db_paths[path_id].path;
   }
+  // Remove trailing slash to avoid double slashes in the final path
+  if (!path.empty() && path.back() == '/') {
+    path.pop_back();
+  }
   return MakeTableFileName(path, number);
 }
 

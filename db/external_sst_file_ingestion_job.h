@@ -210,6 +210,15 @@ class ExternalSstFileIngestionJob {
   // REQUIRES: Mutex held
   Status CheckLevelForIngestedBehindFile(IngestedFileInfo* file_to_ingest);
 
+  // S3 ingestion mode: Check if file can be ingested to the specified target
+  // level and assign the level. Used when s3_ingest option is enabled.
+  // REQUIRES: Mutex held
+  Status CheckLevelForS3IngestedFile(SuperVersion* sv,
+                                     IngestedFileInfo* file_to_ingest,
+                                     int target_level,
+                                     SequenceNumber last_seqno,
+                                     SequenceNumber* assigned_seqno);
+
   // Set the file global sequence number to `seqno`
   Status AssignGlobalSeqnoForIngestedFile(IngestedFileInfo* file_to_ingest,
                                           SequenceNumber seqno);

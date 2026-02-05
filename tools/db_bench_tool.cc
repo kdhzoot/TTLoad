@@ -38,6 +38,14 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <regex>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <map>
+#include <limits>
+#include <random>
 
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
@@ -62,6 +70,7 @@
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/stats_history.h"
 #include "rocksdb/table.h"
+#include "rocksdb/threadpool.h"
 #include "rocksdb/utilities/backup_engine.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/optimistic_transaction_db.h"
@@ -91,6 +100,7 @@
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/merge_operators/sortlist.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
+#include "file/filename.h"
 
 #ifdef MEMKIND
 #include "memory/memkind_kmem_allocator.h"
@@ -325,6 +335,9 @@ DEFINE_int64(max_scan_distance, 0,
 DEFINE_bool(use_uint64_comparator, false, "use Uint64 user comparator");
 
 DEFINE_int64(batch_size, 1, "Batch size");
+
+DEFINE_string(csv_path, "",
+              "Path to CSV file containing level statistics for S3DoWriteSST operation");
 
 static bool ValidateKeySize(const char* /*flagname*/, int32_t /*value*/) {
   return true;
@@ -1806,6 +1819,21 @@ DEFINE_bool(track_and_verify_wals_in_manifest, false,
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
+// Global thread pool for S3DoWriteSST operations
+// This avoids std::thread creation/destruction overhead and reduces
+// std::error_code::default_error_condition calls
+static std::unique_ptr<ThreadPool> s3_thread_pool;
+static std::once_flag g_thread_pool_init_flag;
+
+static ThreadPool* GetS3ThreadPool() {
+  std::call_once(g_thread_pool_init_flag, []() {
+    int base_threads = FLAGS_threads > 0 ? FLAGS_threads : 1;
+    int num_threads = base_threads * 5;  // Max level 5
+    s3_thread_pool.reset(NewThreadPool(num_threads));
+  });
+  return s3_thread_pool.get();
+}
+
 static Status CreateMemTableRepFactory(
     const ConfigOptions& config_options,
     std::shared_ptr<MemTableRepFactory>* factory) {
@@ -2733,6 +2761,634 @@ class Duration {
   uint64_t start_at_;
 };
 
+// CSV Parsing - S3
+struct LevelStats {
+  int level;
+  uint64_t level_min, level_max;
+  double kd_mean, kd_std, gap_mean, gap_std;
+  int sst_count;
+  // kd distribution parameters
+  double kd_min, kd_max, kd_q1, kd_q2, kd_q3;
+  double kd_shape;
+  double kd_loc;
+  double kd_scale;
+  // gap distribution parameters
+  double gap_min, gap_max, gap_q1, gap_q2, gap_q3;
+  double gap_pareto_shape, gap_pareto_scale;
+  // entry distribution parameters (for num_keys sampling)
+  double entry_mean;
+  double entry_std;
+  double entry_min, entry_max, entry_q1, entry_q2, entry_q3;
+  double entry_weibull_shape, entry_weibull_loc, entry_weibull_scale;
+  // Ln_entry distribution parameters
+  double Ln_entry_mean;
+  // spike and tail sampling parameters
+  double entry_spike_min, entry_spike_max;
+  double entry_spike_ratio;
+  int entry_spike_count;
+  int entry_tail_count;
+};
+
+struct SST { // - S3
+  int file_num = 8;
+  int level;
+  uint64_t min_k;
+  uint64_t max_k;
+  uint64_t num_keys;
+  std::string out_path;
+};
+
+static inline std::string csv_trim(std::string s) {
+  auto wsfront = find_if_not(s.begin(), s.end(), ::isspace);
+  auto wsback  = find_if_not(s.rbegin(), s.rend(), ::isspace).base();
+  if (wsfront >= wsback) return std::string();
+  return std::string(wsfront, wsback);
+}
+
+static std::vector<std::string> split_csv_line(const std::string& line) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : line) {
+    if (c == ',') {
+      out.push_back(csv_trim(cur));
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  out.push_back(csv_trim(cur));
+  return out;
+}
+
+static bool to_uint64(const std::string& s, uint64_t& out) {
+  if (s.empty()) { out = 0; return true; }
+  try {
+    double d = stod(s);
+    if (d < 0) { out = 0; return true; }
+    out = static_cast<uint64_t>(d);
+    return true;
+  } catch (...) { out = 0; return false; }
+}
+
+static bool to_int(const std::string& s, int& out) {
+  if (s.empty()) { out = 0; return true; }
+  try {
+    double d = stod(s);
+    out = static_cast<int>(llround(d));
+    return true;
+  } catch (...) { out = 0; return false; }
+}
+
+static bool to_double(const std::string& s, double& out) {
+  if (s.empty()) { out = 0.0; return true; }
+  try { out = stod(s); return true; } catch (...) { out = 0.0; return false; }
+}
+
+std::vector<LevelStats> LevelStatsFromCsv(const std::string& path) {
+  std::ifstream f(path); 
+  if (!f.is_open()) {
+    fprintf(stderr, "Failed to open CSV file: %s\n", path.c_str());
+  }
+  
+  std::string header_line, data_line;
+  if (!getline(f, header_line)) {
+    fprintf(stderr, "CSV file is empty: %s\n", path.c_str());
+  }
+  if (!getline(f, data_line)) {
+    fprintf(stderr, "CSV file has only header line: %s\n", path.c_str());
+  }
+  
+  std::vector<std::string> headers = split_csv_line(header_line);
+  std::vector<std::string> values  = split_csv_line(data_line);
+
+  std::unordered_map<std::string,std::string> col;
+  for (size_t i = 1; i < headers.size(); ++i) {
+    col[headers[i]] = (i < values.size() ? values[i] : "");
+  }
+
+  int max_header_level = -1;
+  std::regex re("^L(\\d+)_");
+  std::smatch m;
+  for (const auto& kv : col) {
+    if (std::regex_search(kv.first, m, re)) {
+      max_header_level = std::max(max_header_level, std::stoi(m[1].str()));
+    }
+  }
+
+  int l0_count = 0;
+  if (col.count("L0_count"))
+    to_int(col["L0_count"], l0_count);
+
+  std::vector<int> levels;
+  if (l0_count == 0) {
+    for (int i = 1; i <= max_header_level; ++i) levels.push_back(i);
+  } else {
+    for (int i = 0; i <= max_header_level; ++i) levels.push_back(i);
+  }
+
+  auto get = [&](const std::string& key) -> std::string {
+    auto it = col.find(key);
+    return (it == col.end()) ? "" : it->second;
+  };
+
+  std::vector<LevelStats> lv_stats;
+  lv_stats.reserve(levels.size());
+  for (int lvl : levels) {
+    const std::string p = "L" + std::to_string(lvl) + "_";
+    LevelStats lvs;
+    lvs.level = lvl;
+    to_int(get(p + "count"), lvs.sst_count);
+    to_uint64(get(p + "min_key"), lvs.level_min);
+    to_uint64(get(p + "max_key"), lvs.level_max);
+    to_double(get(p + "kd_mean"),  lvs.kd_mean);
+    to_double(get(p + "kd_std"),   lvs.kd_std);
+    to_double(get(p + "gap_mean"), lvs.gap_mean);
+    to_double(get(p + "gap_std"),  lvs.gap_std);
+    // kd distribution parameters
+    to_double(get(p + "kd_min"), lvs.kd_min);
+    to_double(get(p + "kd_max"), lvs.kd_max);
+    to_double(get(p + "kd_q1"), lvs.kd_q1);
+    to_double(get(p + "kd_q2"), lvs.kd_q2);
+    to_double(get(p + "kd_q3"), lvs.kd_q3);
+    to_double(get(p + "kd_shape"), lvs.kd_shape);
+    to_double(get(p + "kd_loc"), lvs.kd_loc);
+    to_double(get(p + "kd_scale"), lvs.kd_scale);
+    // gap distribution parameters
+    to_double(get(p + "gap_min"), lvs.gap_min);
+    to_double(get(p + "gap_max"), lvs.gap_max);
+    to_double(get(p + "gap_q1"), lvs.gap_q1);
+    to_double(get(p + "gap_q2"), lvs.gap_q2);
+    to_double(get(p + "gap_q3"), lvs.gap_q3);
+    to_double(get(p + "gap_pareto_shape"), lvs.gap_pareto_shape);
+    to_double(get(p + "gap_pareto_scale"), lvs.gap_pareto_scale);
+    // entry distribution parameters
+    to_double(get(p + "entry_mean"), lvs.entry_mean);
+    to_double(get(p + "entry_std"), lvs.entry_std);
+    to_double(get(p + "entry_min"), lvs.entry_min);
+    to_double(get(p + "entry_max"), lvs.entry_max);
+    to_double(get(p + "entry_q1"), lvs.entry_q1);
+    to_double(get(p + "entry_q2"), lvs.entry_q2);
+    to_double(get(p + "entry_q3"), lvs.entry_q3);
+    to_double(get(p + "entry_weibull_shape"), lvs.entry_weibull_shape);
+    to_double(get(p + "entry_weibull_loc"), lvs.entry_weibull_loc);
+    to_double(get(p + "entry_weibull_scale"), lvs.entry_weibull_scale);
+    // Ln_entry distribution parameters
+    to_double(get(p + "Ln_entry_mean"), lvs.Ln_entry_mean);
+    // spike and tail sampling parameters
+    to_double(get(p + "entry_spike_min"), lvs.entry_spike_min);
+    to_double(get(p + "entry_spike_max"), lvs.entry_spike_max);
+    to_double(get(p + "entry_spike_ratio"), lvs.entry_spike_ratio);
+    to_int(get(p + "entry_spike_count"), lvs.entry_spike_count);
+    to_int(get(p + "entry_tail_count"), lvs.entry_tail_count);
+    lv_stats.push_back(lvs);
+  }
+
+  fprintf(stderr, "[LevelStatsFromCsv] Parsed %zu levels from CSV:\n", lv_stats.size());
+  for (const auto& lvs : lv_stats) {
+    fprintf(stderr, "  L%d: sst_count=%d, min_key=%" PRIu64 ", max_key=%" PRIu64 "\n",
+            lvs.level, lvs.sst_count, lvs.level_min, lvs.level_max);
+  }
+
+  return lv_stats;
+}
+
+static double sample_fisk(std::mt19937& gen, double shape, double scale) {
+  if (shape <= 0 || scale <= 0) return 1.0;
+  std::uniform_real_distribution<double> uniform(0.000001, 0.999999);
+  double u = uniform(gen);
+  double ratio = u / (1.0 - u);
+  return scale * std::pow(ratio, 1.0 / shape);
+}
+
+static double sample_weibull(std::mt19937& gen, double shape, double loc, double scale) {
+  if (shape <= 0 || scale <= 0) return 1.0;
+  std::uniform_real_distribution<double> uniform(0.000001, 0.999999);
+  double u = uniform(gen);
+  double sample = loc + scale * std::pow(-std::log(1.0 - u), 1.0 / shape);
+  return std::max(1.0, sample);
+}
+
+std::vector<SST> MakeSSTsFromLevel(const LevelStats& level_row,
+                                   int start_file_number,
+                                   const std::string& output_dir,
+                                   [[maybe_unused]] uint64_t target_sst_bytes,
+                                   [[maybe_unused]] uint64_t key_size,
+                                   [[maybe_unused]] uint64_t value_size,
+                                   int total_levels,
+                                   [[maybe_unused]] const std::vector<uint64_t>* log_kv_counts) {
+  std::vector<SST> sst_files;
+  if (level_row.sst_count <= 0) return sst_files;
+
+  uint64_t total_range = level_row.level_max - level_row.level_min + 1;
+  int sst_count = level_row.sst_count;
+  
+  uint64_t seed = ::seed_base.has_value() 
+    ? static_cast<uint64_t>(*::seed_base) + static_cast<uint64_t>(level_row.level) * 1000000 + static_cast<uint64_t>(start_file_number)
+    : static_cast<uint64_t>(start_file_number) * 1000 + static_cast<uint64_t>(level_row.level);
+  std::mt19937 gen(seed);
+
+  std::string dist_model;
+  int level = level_row.level;
+  if (level == 1) {
+    dist_model = "none";
+  } else if (level == 2) {
+    dist_model = "uniform";
+  } else if (level >= 3 && level < total_levels) {
+    dist_model = "fisk";
+  } else if (level == total_levels) {
+    //dist_model = "lognormal";
+    dist_model = "fisk";
+  }
+
+  std::vector<double> kd_samples;
+  kd_samples.reserve(sst_count);
+
+  if (dist_model == "none" || level_row.level == 1) {
+    if (level_row.kd_q1 > 0 && level_row.kd_q2 > 0 && level_row.kd_q3 > 0) {
+      std::uniform_real_distribution<double> uniform(0.0, 1.0);
+      for (int i = 0; i < sst_count; ++i) {
+        double percentile = (sst_count > 1) ? static_cast<double>(i) / (sst_count - 1) : 0.5;
+        percentile += (uniform(gen) - 0.5) * 0.1;
+        percentile = std::max(0.0, std::min(1.0, percentile));
+        
+        double kd_value;
+        if (percentile <= 0.25) {
+          kd_value = level_row.kd_min + (percentile / 0.25) * (level_row.kd_q1 - level_row.kd_min);
+        } else if (percentile <= 0.5) {
+          kd_value = level_row.kd_q1 + ((percentile - 0.25) / 0.25) * (level_row.kd_q2 - level_row.kd_q1);
+        } else if (percentile <= 0.75) {
+          kd_value = level_row.kd_q2 + ((percentile - 0.5) / 0.25) * (level_row.kd_q3 - level_row.kd_q2);
+        } else {
+          kd_value = level_row.kd_q3 + ((percentile - 0.75) / 0.25) * (level_row.kd_max - level_row.kd_q3);
+        }
+        kd_samples.push_back(std::max(level_row.kd_min, std::min(level_row.kd_max, kd_value)));
+      }
+    } else if (level_row.kd_std > 0 && level_row.kd_mean > 0) {
+      std::normal_distribution<double> normal_dist(level_row.kd_mean, level_row.kd_std);
+      for (int i = 0; i < sst_count; ++i) {
+        double kd_value = normal_dist(gen);
+        kd_value = std::max(level_row.kd_min, std::min(level_row.kd_max, kd_value));
+        kd_samples.push_back(kd_value);
+      }
+    } 
+  } else if (dist_model == "uniform" || level_row.level == 2) {
+    double kd_min = level_row.kd_loc > 0 ? level_row.kd_loc : (level_row.kd_min > 0 ? level_row.kd_min : 1.0);
+    double kd_max_from_scale = level_row.kd_scale > 0 ? (kd_min + level_row.kd_scale) : 0.0;
+    double kd_max = 0.0;
+    
+    if (kd_max_from_scale > 0 && level_row.kd_max > 0) {
+      kd_max = std::min(kd_max_from_scale, level_row.kd_max);
+    } else if (kd_max_from_scale > 0) {
+      kd_max = kd_max_from_scale;
+    } else if (level_row.kd_max > 0) {
+      kd_max = level_row.kd_max;
+    } else {
+      kd_max = kd_min + 1.0;
+    }
+    
+    if (level_row.kd_min > 0 && level_row.kd_min > kd_min) {
+      kd_min = level_row.kd_min;
+    }
+    
+    std::uniform_real_distribution<double> uniform_dist(kd_min, kd_max);
+    for (int i = 0; i < sst_count; ++i) {
+      kd_samples.push_back(uniform_dist(gen));
+    }
+  } else if (dist_model == "fisk") {
+    double shape = level_row.kd_shape > 0 ? level_row.kd_shape : 1.0;
+    double scale = level_row.kd_scale > 0 ? level_row.kd_scale : (level_row.kd_mean > 0 ? level_row.kd_mean : 1.0);
+    
+    double kd_min = level_row.kd_min > 0 ? level_row.kd_min : 0.0;
+    double kd_max = level_row.kd_max > 0 ? level_row.kd_max : std::numeric_limits<double>::max();
+    
+    for (int i = 0; i < sst_count; ++i) {
+      double sample = sample_fisk(gen, shape, scale);
+      if (kd_min > 0) sample = std::max(kd_min, sample);
+      if (kd_max < std::numeric_limits<double>::max()) sample = std::min(kd_max, sample);
+      kd_samples.push_back(sample);
+    }
+  } else if (dist_model == "lognormal" || level_row.level == total_levels) {
+    double kd_shape = level_row.kd_shape > 0 ? level_row.kd_shape : 1.0;
+    double kd_scale = level_row.kd_scale > 0 ? level_row.kd_scale : (level_row.kd_mean > 0 ? level_row.kd_mean : 1.0);
+    
+    double kd_lognorm_m, kd_lognorm_s;
+    
+    if (level_row.kd_mean > 0 && level_row.kd_std > 0) {
+      double mean = level_row.kd_mean;
+      double std = level_row.kd_std;
+      double variance = std * std;
+      kd_lognorm_m = std::log(mean * mean / std::sqrt(variance + mean * mean));
+      kd_lognorm_s = std::sqrt(std::log(1.0 + variance / (mean * mean)));
+    } else {
+      kd_lognorm_m = std::log(kd_scale);
+      kd_lognorm_s = kd_shape;
+    }
+    
+    std::lognormal_distribution<double> kd_dist(kd_lognorm_m, kd_lognorm_s);
+    
+    double kd_min = level_row.kd_min > 0 ? level_row.kd_min : 0.0;
+    double kd_max = level_row.kd_max > 0 ? level_row.kd_max : std::numeric_limits<double>::max();
+    
+    for (int i = 0; i < sst_count; ++i) {
+      double sample = kd_dist(gen);
+      if (kd_min > 0) sample = std::max(kd_min, sample);
+      if (kd_max < std::numeric_limits<double>::max()) sample = std::min(kd_max, sample);
+      kd_samples.push_back(sample);
+    }
+  } else {
+    double kd_min = level_row.kd_min > 0 ? level_row.kd_min : 1.0;
+    double kd_max = level_row.kd_max > 0 ? level_row.kd_max : 2.0;
+    std::uniform_real_distribution<double> uniform_dist(kd_min, kd_max);
+    for (int i = 0; i < sst_count; ++i) {
+      kd_samples.push_back(uniform_dist(gen));
+    }
+  }
+
+  std::vector<double> gap_samples;
+  if (sst_count > 1) {
+    gap_samples.reserve(sst_count - 1);
+    double gap_pareto_shape = level_row.gap_pareto_shape > 0 ? level_row.gap_pareto_shape : 1.0;
+    double gap_pareto_scale = level_row.gap_pareto_scale > 0 ? level_row.gap_pareto_scale : (level_row.gap_min > 0 ? level_row.gap_min : 1.0);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    for (int i = 0; i < sst_count - 1; ++i) {
+      double u = std::min(0.999999, uniform(gen));
+      gap_samples.push_back(gap_pareto_scale / std::pow(1.0 - u, 1.0 / gap_pareto_shape));
+    }
+  }
+
+  auto adjust = [](std::vector<double>& samples, double v_min, double v_q1, double v_q2, double v_q3, double v_max, double v_mean, double v_std) {
+    if (samples.empty()) return;
+    int n = samples.size();
+    if (v_q1 > 0 && v_q2 > 0 && v_q3 > 0) {
+      std::vector<double> sorted = samples;
+      std::sort(sorted.begin(), sorted.end());
+      std::vector<double> original = samples;
+      
+      bool all_same = true;
+      for (size_t i = 1; i < sorted.size(); ++i) {
+        if (std::abs(sorted[i] - sorted[0]) > 1e-10) {
+          all_same = false;
+          break;
+        }
+      }
+      
+      if (all_same && n > 1) {
+        for (size_t i = 0; i < original.size(); ++i) {
+          double percentile = static_cast<double>(i) / (n - 1);
+          double s;
+          if (percentile <= 0.25) s = v_min + (percentile / 0.25) * (v_q1 - v_min);
+          else if (percentile <= 0.5) s = v_q1 + ((percentile - 0.25) / 0.25) * (v_q2 - v_q1);
+          else if (percentile <= 0.75) s = v_q2 + ((percentile - 0.5) / 0.25) * (v_q3 - v_q2);
+          else s = v_q3 + ((percentile - 0.75) / 0.25) * (v_max - v_q3);
+          samples[i] = std::max(v_min, std::min(v_max, s));
+        }
+      } else {
+        for (size_t i = 0; i < original.size(); ++i) {
+          auto it = std::lower_bound(sorted.begin(), sorted.end(), original[i]);
+          double percentile = n > 1 ? static_cast<double>(std::distance(sorted.begin(), it)) / (n - 1) : 0.0;
+          double s;
+          if (percentile <= 0.25) s = v_min + (percentile / 0.25) * (v_q1 - v_min);
+          else if (percentile <= 0.5) s = v_q1 + ((percentile - 0.25) / 0.25) * (v_q2 - v_q1);
+          else if (percentile <= 0.75) s = v_q2 + ((percentile - 0.5) / 0.25) * (v_q3 - v_q2);
+          else s = v_q3 + ((percentile - 0.75) / 0.25) * (v_max - v_q3);
+          samples[i] = std::max(v_min, std::min(v_max, s));
+        }
+      }
+    } else if (v_std > 0 && v_mean > 0) {
+      double sum = 0, sq_sum = 0;
+      for (double s : samples) sum += s;
+      double mean_actual = sum / n;
+      for (double s : samples) sq_sum += (s - mean_actual) * (s - mean_actual);
+      double std_actual = std::sqrt(sq_sum / (n > 1 ? n - 1 : 1));
+      double scale = (std_actual > 0) ? v_std / std_actual : 1.0;
+      for (double& s : samples) {
+        s = (s - mean_actual) * scale + v_mean;
+        s = std::max(v_min, std::min(v_max, s));
+      }
+    }
+    for (double& s : samples) {
+      s = std::max(v_min, std::min(v_max, s));
+    }
+  };
+
+  adjust(kd_samples, 1.0, 
+         level_row.kd_q1, level_row.kd_q2, level_row.kd_q3, 
+         level_row.kd_max > 0 ? level_row.kd_max : std::numeric_limits<double>::max(),
+         level_row.kd_mean, level_row.kd_std);
+  
+  adjust(gap_samples, level_row.gap_min, level_row.gap_q1, level_row.gap_q2, level_row.gap_q3, 
+         level_row.gap_max > 0 ? level_row.gap_max : std::numeric_limits<double>::max(),
+         level_row.gap_mean, level_row.gap_std);
+
+  std::vector<uint64_t> entry_samples;
+  entry_samples.reserve(static_cast<size_t>(sst_count));
+  
+  int spike_count = level_row.entry_spike_count > 0 ? level_row.entry_spike_count : 0;
+  int tail_count = level_row.entry_tail_count > 0 ? level_row.entry_tail_count : 0;
+  
+  if (spike_count + tail_count > sst_count) {
+    double ratio = static_cast<double>(sst_count) / (spike_count + tail_count);
+    spike_count = static_cast<int>(std::llround(spike_count * ratio));
+    tail_count = sst_count - spike_count;
+  }
+  
+  if (spike_count == 0 && tail_count == 0) {
+    tail_count = sst_count;
+  }
+  
+  double spike_min = level_row.entry_spike_min > 0 ? level_row.entry_spike_min : 1.0;
+  double spike_max = level_row.entry_spike_max > 0 ? level_row.entry_spike_max : spike_min;
+  if (spike_max < spike_min) spike_max = spike_min;
+  
+  std::uniform_real_distribution<double> spike_dist(spike_min, spike_max);
+  for (int i = 0; i < spike_count; ++i) {
+    double sample = spike_dist(gen);
+    uint64_t entry_val = static_cast<uint64_t>(std::llround(sample));
+    if (entry_val < 1) entry_val = 1;
+    entry_samples.push_back(entry_val);
+  }
+  
+  if (tail_count > 0 && level_row.entry_weibull_shape > 0 && level_row.entry_weibull_scale > 0) {
+    for (int i = 0; i < tail_count; ++i) {
+      double sample = sample_weibull(gen, level_row.entry_weibull_shape, 
+                                      level_row.entry_weibull_loc, 
+                                      level_row.entry_weibull_scale);
+      uint64_t entry_val = static_cast<uint64_t>(std::llround(sample));
+      if (entry_val < 1) entry_val = 1;
+      if (level_row.entry_max > 0 && entry_val > static_cast<uint64_t>(level_row.entry_max)) {
+        entry_val = static_cast<uint64_t>(level_row.entry_max);
+      }
+      if (level_row.entry_min > 0 && entry_val < static_cast<uint64_t>(level_row.entry_min)) {
+        entry_val = static_cast<uint64_t>(level_row.entry_min);
+      }
+      entry_samples.push_back(entry_val);
+    }
+  } else if (tail_count > 0) {
+    for (int i = 0; i < tail_count; ++i) {
+      double sample = sample_weibull(gen, 1.0, 0.0, 1.0);
+      uint64_t entry_val = static_cast<uint64_t>(std::llround(sample));
+      if (entry_val < 1) entry_val = 1;
+      entry_samples.push_back(entry_val);
+    }
+  }
+  
+  while (static_cast<int>(entry_samples.size()) < sst_count) {
+    uint64_t default_val = 1;
+    if (level_row.entry_mean > 0) {
+      default_val = static_cast<uint64_t>(std::llround(level_row.entry_mean));
+      if (default_val < 1) default_val = 1;
+    }
+    entry_samples.push_back(default_val);
+  }
+  
+  if (static_cast<int>(entry_samples.size()) != sst_count) {
+    while (static_cast<int>(entry_samples.size()) < sst_count) {
+      uint64_t default_val = 1;
+      if (level_row.entry_mean > 0) {
+        default_val = static_cast<uint64_t>(std::llround(level_row.entry_mean));
+        if (default_val < 1) default_val = 1;
+      }
+      entry_samples.push_back(default_val);
+    }
+    if (static_cast<int>(entry_samples.size()) > sst_count) {
+      entry_samples.resize(static_cast<size_t>(sst_count));
+    }
+  }
+  
+  std::shuffle(entry_samples.begin(), entry_samples.end(), gen);
+
+  uint64_t total_gap = 0;
+  for (double gap : gap_samples) total_gap += static_cast<uint64_t>(std::llround(gap));
+  
+  std::vector<uint64_t> widths(static_cast<size_t>(sst_count), 1);
+  for (int i = 0; i < sst_count; ++i) {
+    double kd = (i < static_cast<int>(kd_samples.size())) ? kd_samples[i] : 1.0;
+    uint64_t entry = (i < static_cast<int>(entry_samples.size())) ? entry_samples[i] : 1;
+    double width_double = kd * static_cast<double>(entry);
+    widths[i] = static_cast<uint64_t>(std::llround(width_double));
+    if (widths[i] < 1) widths[i] = 1;  
+  }
+  
+  uint64_t total_widths = 0;
+  for (uint64_t w : widths) total_widths += w;
+  
+  uint64_t total_needed = total_gap + total_widths;
+  if (total_needed > total_range && total_needed > 0) {
+    uint64_t max_allowed_widths = total_range;  
+    if (total_widths <= max_allowed_widths) {
+      double gap_scale = (total_gap > 0) ? 
+        static_cast<double>(total_range - total_widths) / static_cast<double>(total_gap) : 0.0;
+      if (gap_scale < 0.0) gap_scale = 0.0;
+      
+      for (double& gap : gap_samples) {
+        gap *= gap_scale;
+      }
+    } else {
+      for (double& gap : gap_samples) {
+        gap = 0.0;
+      }
+      
+      double kd_scale = static_cast<double>(total_range) / static_cast<double>(total_widths);
+      
+      for (int i = 0; i < sst_count; ++i) {
+        if (i < static_cast<int>(kd_samples.size())) {
+          kd_samples[i] *= kd_scale;
+          if (kd_samples[i] < 1.0) kd_samples[i] = 1.0; 
+        }
+      }
+      
+      for (int i = 0; i < sst_count; ++i) {
+        double kd = (i < static_cast<int>(kd_samples.size())) ? kd_samples[i] : 1.0;
+        uint64_t entry = (i < static_cast<int>(entry_samples.size())) ? entry_samples[i] : 1;
+        double width_double = kd * static_cast<double>(entry);
+        widths[i] = static_cast<uint64_t>(std::llround(width_double));
+        if (widths[i] < 1) widths[i] = 1;
+      }
+    }
+    
+    total_gap = 0;
+    for (double gap : gap_samples) total_gap += static_cast<uint64_t>(std::llround(gap));
+    total_widths = 0;
+    for (uint64_t w : widths) total_widths += w;
+  }
+
+  uint64_t current_key = level_row.level_min;
+  
+  for (int i = 0; i < sst_count; ++i) {
+    if (current_key > level_row.level_max) {
+      //fprintf(stderr, "[MakeSSTsFromLevel] L%d: ERROR at i=%d/%d: current_key=%" PRIu64 " > level_max=%" PRIu64 " - STOPPING\n",
+      //        level_row.level, i, sst_count, current_key, level_row.level_max);
+      break;
+    }
+    
+    uint64_t range_start = current_key;
+    uint64_t range_end;
+    uint64_t num_keys = (i < static_cast<int>(entry_samples.size())) ? entry_samples[i] : 1;
+    if (num_keys == 0) num_keys = 1;
+
+    if (i == sst_count - 1) {
+      range_end = level_row.level_max;
+      //printf("[MakeSSTsFromLevel] L%d: LAST FILE i=%d/%d range_start=%" PRIu64 " range_end=%" PRIu64 " level_max=%" PRIu64 "\n",
+      //        level_row.level, i, sst_count, range_start, range_end, level_row.level_max);
+    } else {
+      uint64_t w = widths[i];
+      range_end = range_start + (w >= 1 ? w - 1 : 0);
+      if (range_end > level_row.level_max) {
+        range_end = level_row.level_max;
+      }
+      if (range_end < range_start) {
+        range_end = range_start;
+      }
+    }
+
+    if (range_start > level_row.level_max) {
+      //fprintf(stderr, "[MakeSSTsFromLevel] L%d: ERROR at i=%d/%d: range_start=%" PRIu64 " > level_max=%" PRIu64 " - SKIPPING FILE (files created so far: %zu)\n",
+      //        level_row.level, i, sst_count, range_start, level_row.level_max, sst_files.size());
+      if (i < sst_count - 1) {
+        uint64_t gap = (i < static_cast<int>(gap_samples.size())) 
+                        ? static_cast<uint64_t>(std::llround(gap_samples[i])) 
+                        : 0;
+        uint64_t next_key = range_end + 1 + gap;
+        current_key = (next_key > level_row.level_max) ? level_row.level_max + 1 : next_key;
+      }
+      continue;
+    }
+    
+    if (range_end > level_row.level_max) {
+      range_end = level_row.level_max;
+    }
+
+    SST sst;
+    sst.file_num = start_file_number + static_cast<int>(sst_files.size());
+    sst.level = level_row.level;
+    sst.min_k = range_start;
+    sst.max_k = range_end;
+    sst.num_keys = num_keys;
+    sst.out_path = MakeTableFileName(output_dir, static_cast<uint64_t>(sst.file_num));
+    sst_files.push_back(sst);
+
+    if (i < sst_count - 1) {
+      uint64_t gap = (i < static_cast<int>(gap_samples.size())) 
+                      ? static_cast<uint64_t>(std::llround(gap_samples[i])) 
+                      : 0;
+      uint64_t next_key = range_end + 1 + gap;
+      
+      if (next_key > level_row.level_max) {
+        //fprintf(stderr, "[MakeSSTsFromLevel] L%d: WARNING at i=%d: next_key=%" PRIu64 " > level_max=%" PRIu64 ", setting to level_max+1\n",
+        //        level_row.level, i, next_key, level_row.level_max);
+        current_key = level_row.level_max + 1;
+      } else {
+        current_key = next_key;
+      }
+    }
+  }
+  
+  //printf("[MakeSSTsFromLevel] L%d: target_sst_count=%d actual_sst_count=%zu (entry_samples based)\n",
+  //        level_row.level, level_row.sst_count, sst_files.size());
+
+  return sst_files;
+}
+
 class Benchmark {
  private:
   std::shared_ptr<Cache> cache_;
@@ -3553,6 +4209,9 @@ class Benchmark {
       } else if (name == "fillrandom") {
         fresh_db = true;
         method = &Benchmark::WriteRandom;
+      } else if (name == "ttload") {
+        fresh_db = true;
+        method = &Benchmark::S3WriteSST;
       } else if (name == "filluniquerandom" ||
                  name == "fillanddeleteuniquerandom") {
         fresh_db = true;
@@ -5050,6 +5709,378 @@ class Benchmark {
   void WriteSeq(ThreadState* thread) { DoWrite(thread, SEQUENTIAL); }
 
   void WriteRandom(ThreadState* thread) { DoWrite(thread, RANDOM); }
+
+  void S3WriteSST(ThreadState* thread) { S3DoWriteSST(thread, RANDOM); }
+
+  Status S3WriteKeysToSSTFile(const SST* sst, SstFileWriter& sst_file_writer, 
+                           RandomGenerator& gen_local) {
+    uint64_t keys_per_sst = sst->num_keys;
+    uint64_t key_range = sst->max_k - sst->min_k + 1;
+    if (keys_per_sst == 0) {
+      return Status::InvalidArgument("Invalid SST metadata: keys_per_sst is 0");
+    }
+    
+    if (key_range < keys_per_sst) {
+      fprintf(stderr, "[S3WriteKeysToSSTFile] ERROR: file_num=%d key_range=%" PRIu64 " < keys_per_sst=%" PRIu64 "\n",
+              sst->file_num, key_range, keys_per_sst);
+      return Status::InvalidArgument("key_range < keys_per_sst");
+    }
+    
+    Random64 rand_gen(*seed_base);
+    long double bucket_width = static_cast<long double>(key_range) / static_cast<long double>(keys_per_sst);
+    
+    uint64_t prev_key_num = sst->min_k - 1;
+    uint64_t keys_written = 0;
+    
+    for (uint64_t i = 0; i < keys_per_sst; ++i) {
+        if (prev_key_num >= sst->max_k) {
+          break;
+        }
+        
+        long double theoretical_bucket_start = bucket_width * static_cast<long double>(i);
+        long double theoretical_bucket_end = bucket_width * static_cast<long double>(i + 1);
+        
+        uint64_t theoretical_min = sst->min_k + static_cast<uint64_t>(theoretical_bucket_start);
+        uint64_t theoretical_max = sst->min_k + static_cast<uint64_t>(theoretical_bucket_end);
+        
+        if (theoretical_max > sst->max_k) {
+          theoretical_max = sst->max_k;
+        }
+        
+        uint64_t bucket_min = std::max(prev_key_num + 1, theoretical_min);  
+        uint64_t bucket_max = std::min(theoretical_max, sst->max_k);
+        
+        if (bucket_min > bucket_max) {
+          break;
+        }
+        
+        uint64_t bucket_range = bucket_max - bucket_min + 1;
+        uint64_t key_num;
+        
+        if (bucket_range <= 1) {
+          key_num = bucket_min;
+        } else {
+          long double random_ratio =
+              static_cast<long double>(rand_gen.Next()) /
+              static_cast<long double>(std::numeric_limits<uint64_t>::max());
+          uint64_t offset = static_cast<uint64_t>(
+              random_ratio * static_cast<long double>(bucket_range - 1));
+          key_num = bucket_min + offset;
+        }
+        
+        if (key_num <= prev_key_num) {
+          key_num = prev_key_num + 1;
+        }
+        if (key_num > sst->max_k) {
+          key_num = sst->max_k;
+        }
+        
+        if (key_num == prev_key_num) {
+          break;
+        }
+        
+        prev_key_num = key_num;
+        
+        std::unique_ptr<const char[]> key_guard;
+        Slice key = AllocateKey(&key_guard);
+        GenerateKeyFromInt(key_num, FLAGS_num, &key);
+        Slice val = gen_local.Generate();
+    
+        Status s = sst_file_writer.Put(key, val);
+        
+        if (!s.ok()) {
+          fprintf(stderr, "[S3WriteKeysToSSTFile] ERROR: file_num=%d failed at i=%" PRIu64 "/%" PRIu64 " (keys_written=%" PRIu64 ", key_num=%" PRIu64 "): %s\n",
+                  sst->file_num, i, keys_per_sst, keys_written, key_num, s.ToString().c_str());
+          return s;
+        }
+        
+        keys_written++;
+    }
+    
+    return Status::OK();
+  }
+
+  void S3DoWriteSST([[maybe_unused]]ThreadState* thread, [[maybe_unused]]WriteMode write_mode) {
+    Options options = open_options_;
+    IngestExternalFileOptions ifo;
+    ifo.move_files = false;
+
+    int64_t stage = 0;
+    size_t id = 0;
+
+    if (db_.db != nullptr) {
+      db_.CreateNewCf(open_options_, stage);
+    }
+    DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(id);
+
+    static std::atomic<bool> processing_started(false);
+   
+    bool expected = false;
+    if (!processing_started.compare_exchange_strong(expected, true)) {
+      return; 
+    }
+    
+    if (FLAGS_csv_path.empty()) {
+      fprintf(stderr, "[S3DoWriteSST] ERROR: --csv_path must be specified\n");
+      return;
+    }
+    
+    const std::string csv_path = FLAGS_csv_path;
+    std::vector<LevelStats> levels = LevelStatsFromCsv(csv_path);
+
+    int next_file_number = 8;
+    
+    std::string output_dir = FLAGS_db;
+    while (!output_dir.empty() && output_dir.back() == '/') {
+      output_dir.pop_back();
+    }
+
+    ThreadPool* thread_pool = GetS3ThreadPool();
+    std::atomic<int> pending_level_jobs(0);
+    std::mutex level_completion_mutex;
+    std::condition_variable level_completion_cv;
+    std::vector<std::condition_variable> level_cvs(levels.size());
+    std::vector<std::mutex> level_mutexes(levels.size());
+    std::vector<std::atomic<bool>> level_ingest_started(levels.size());
+    std::atomic<int> next_file_number_atomic(next_file_number);
+    std::mutex file_number_mutex;
+    
+    for (size_t i = 0; i < levels.size(); ++i) {
+      level_ingest_started[i].store(false);
+    }
+    
+    for (size_t level_idx = levels.size(); level_idx-- > 0; ) {
+      const auto& lvl = levels[level_idx];
+      pending_level_jobs++;
+      
+      thread_pool->SubmitJob([&, level_idx, lvl]() {
+        if (level_idx + 1 < levels.size()) {
+          std::unique_lock<std::mutex> prev_lock(level_mutexes[level_idx + 1]);
+          level_cvs[level_idx + 1].wait(prev_lock, [&] {
+            return level_ingest_started[level_idx + 1].load();
+          });
+        }
+
+        // Calculate base threads once for this level
+        int base_threads = FLAGS_threads > 0 ? FLAGS_threads : 1;
+
+        IngestExternalFileOptions ifo_local = ifo;
+        ifo_local.s3_ingest = true;
+        ifo_local.s3_target_level = lvl.level;
+
+        int current_file_number;
+        {
+          std::lock_guard<std::mutex> lock(file_number_mutex);
+          current_file_number = next_file_number_atomic.load();
+        }
+        
+        std::vector<SST> ssts = MakeSSTsFromLevel(lvl, current_file_number, output_dir, 
+                                                   FLAGS_target_file_size_base, FLAGS_key_size, FLAGS_value_size, 
+                                                   static_cast<int>(levels.size()), nullptr);
+        
+        {
+          std::lock_guard<std::mutex> lock(file_number_mutex);
+          next_file_number_atomic.store(current_file_number + static_cast<int>(ssts.size()));
+        }
+      
+        std::queue<const SST*> sst_queue;
+        std::mutex queue_mutex;
+        std::mutex ingest_queue_mutex;
+        std::atomic<int> completed_count(0);
+        std::atomic<int> success_count(0);
+        std::atomic<int> fail_count(0);
+        std::vector<std::string> ingest_queue;  
+        
+        for (const auto& sst : ssts) {
+          sst_queue.push(&sst);
+        }
+        
+        int num_sst_threads = base_threads * (lvl.level == 0 ? 1 : lvl.level);
+        std::atomic<int> pending_sst_jobs(num_sst_threads);
+        std::condition_variable sst_done_cv;
+        std::mutex sst_done_mutex;
+        
+        for (int t = 0; t < num_sst_threads; ++t) {
+          thread_pool->SubmitJob([&, t]() {
+            RandomGenerator gen_local;
+            Options options_local = options;
+            
+            while (true) {
+              const SST* sst = nullptr;
+              {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                if (sst_queue.empty()) {
+                  break;
+                }
+                sst = sst_queue.front();
+                sst_queue.pop();
+              } 
+              
+              std::string sst_path = sst->out_path;
+              Status s = Status::OK();
+              
+              {
+                EnvOptions env_opts;
+                env_opts.use_direct_writes = true;
+                env_opts.use_direct_reads = true;
+                SstFileWriter sst_file_writer(env_opts, options_local);
+                
+                s = sst_file_writer.Open(sst_path);
+                if (!s.ok()) {
+                  fprintf(stderr, "[Level %d SST Thread %d] Failed to open SST file %s: %s (file_num=%d)\n", 
+                          lvl.level, t, sst_path.c_str(), s.ToString().c_str(), sst->file_num);
+                  fail_count++;
+                  completed_count++;
+                  continue;
+                }
+
+                s = S3WriteKeysToSSTFile(sst, sst_file_writer, gen_local);
+                if (!s.ok()) {
+                  fprintf(stderr, "[Level %d SST Thread %d] Failed to write keys to SST file %s: %s (file_num=%d, min_k=%" PRIu64 ", max_k=%" PRIu64 ", num_keys=%" PRIu64 ")\n",
+                          lvl.level, t, sst_path.c_str(), s.ToString().c_str(), sst->file_num, sst->min_k, sst->max_k, sst->num_keys);
+                  fail_count++;
+                  completed_count++;
+                  continue;
+                }
+                
+                s = sst_file_writer.Finish();
+                if (!s.ok()) {
+                  fail_count++;
+                  completed_count++;
+                  continue;
+                }
+                
+                uint64_t file_size = 0;
+                Status size_status = Env::Default()->GetFileSize(sst_path, &file_size);
+                if (!size_status.ok() || file_size == 0) {
+                  s = Status::IOError("SST file not ready after Finish()");
+                  fail_count++;
+                }
+              }
+              
+              if (s.ok()) {
+                std::lock_guard<std::mutex> ingest_lock(ingest_queue_mutex);
+                ingest_queue.push_back(sst_path);
+                success_count++;
+              } else {
+                fail_count++;
+              }
+              
+              completed_count++;
+            }
+            
+            {
+              std::lock_guard<std::mutex> lock(sst_done_mutex);
+              if (--pending_sst_jobs == 0) {
+                sst_done_cv.notify_one();
+              }
+            }
+          });
+        }
+        
+        {
+          std::unique_lock<std::mutex> lock(sst_done_mutex);
+          sst_done_cv.wait(lock, [&] { return pending_sst_jobs.load() == 0; });
+        }
+        
+        if (level_idx > 0) {
+          std::lock_guard<std::mutex> lock(level_mutexes[level_idx]);
+          level_ingest_started[level_idx].store(true);
+          level_cvs[level_idx].notify_all();
+        }
+        
+        if (!ingest_queue.empty()) {
+          int num_ingest_threads = base_threads * (lvl.level == 0 ? 1 : lvl.level);
+          const size_t batch_size = ingest_queue.size() / num_ingest_threads + 1;
+          
+          std::queue<std::vector<std::string>> ingest_batch_queue;
+          std::mutex ingest_batch_queue_mutex;
+          std::condition_variable ingest_batch_queue_cv;
+          bool ingest_done = false;
+          std::atomic<int> ingested_count(0);
+          
+          std::vector<std::string> current_batch;
+          for (size_t i = 0; i < ingest_queue.size(); ++i) {
+            current_batch.push_back(ingest_queue[i]);
+            if (current_batch.size() >= batch_size || i == ingest_queue.size() - 1) {
+              ingest_batch_queue.push(current_batch);
+              current_batch.clear();
+            }
+          }
+          
+          std::atomic<int> pending_ingest_jobs(num_ingest_threads);
+          std::condition_variable ingest_done_cv;
+          std::mutex ingest_done_mutex;
+          
+          for (int t = 0; t < num_ingest_threads; ++t) {
+            thread_pool->SubmitJob([&, t]() {
+              while (true) {
+                std::vector<std::string> batch;
+                {
+                  std::unique_lock<std::mutex> lock(ingest_batch_queue_mutex);
+                  ingest_batch_queue_cv.wait(lock, [&] { return ingest_done || !ingest_batch_queue.empty(); });
+                  
+                  if (ingest_done && ingest_batch_queue.empty()) {
+                    break;
+                  }
+                  
+                  if (!ingest_batch_queue.empty()) {
+                    batch = ingest_batch_queue.front();
+                    ingest_batch_queue.pop();
+                  }
+                }
+                
+                if (batch.empty()) {
+                  continue;
+                }
+                
+                Status s = db_with_cfh->db->IngestExternalFile(batch, ifo_local);
+                if (!s.ok()) {
+                  fprintf(stderr, "[Level %d Ingest Thread %d] Failed to ingest batch of %zu files: %s\n", 
+                          lvl.level, t, batch.size(), s.ToString().c_str());
+                } else {
+                  ingested_count.fetch_add(static_cast<int>(batch.size()));
+                }
+              }
+              
+              {
+                std::lock_guard<std::mutex> lock(ingest_done_mutex);
+                if (--pending_ingest_jobs == 0) {
+                  ingest_done_cv.notify_one();
+                }
+              }
+            });
+          }
+          
+          {
+            std::unique_lock<std::mutex> lock(ingest_batch_queue_mutex);
+            ingest_done = true;
+          }
+          ingest_batch_queue_cv.notify_all();
+          
+          {
+            std::unique_lock<std::mutex> lock(ingest_done_mutex);
+            ingest_done_cv.wait(lock, [&] { return pending_ingest_jobs.load() == 0; });
+          }
+        }
+        
+        {
+          std::lock_guard<std::mutex> lock(level_completion_mutex);
+          if (--pending_level_jobs == 0) {
+            level_completion_cv.notify_one();
+          }
+        }
+      });
+    }
+    
+    {
+      std::unique_lock<std::mutex> lock(level_completion_mutex);
+      level_completion_cv.wait(lock, [&] { return pending_level_jobs.load() == 0; });
+    }
+    
+    thread_pool->WaitForJobsAndJoinAllThreads();
+    processing_started.store(false);
+  }
 
   void WriteUniqueRandom(ThreadState* thread) {
     DoWrite(thread, UNIQUE_RANDOM);
