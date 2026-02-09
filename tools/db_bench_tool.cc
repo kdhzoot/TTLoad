@@ -303,6 +303,8 @@ static std::optional<int64_t> seed_base;
 
 DEFINE_int32(threads, 1, "Number of concurrent threads to run.");
 
+DEFINE_int32(tt_threads, 48, "Number of concurrent threads to use for ttload (internal pool).");
+
 DEFINE_int32(duration, 0,
              "Time in seconds for the random-ops tests to run."
              " When 0 then num & reads determine the test duration");
@@ -1827,7 +1829,7 @@ static std::once_flag g_thread_pool_init_flag;
 
 static ThreadPool* GetS3ThreadPool() {
   std::call_once(g_thread_pool_init_flag, []() {
-    int base_threads = FLAGS_threads > 0 ? FLAGS_threads : 1;
+    int base_threads = FLAGS_tt_threads > 0 ? FLAGS_tt_threads : 1;
     int num_threads = base_threads * 5;  // Max level 5
     s3_thread_pool.reset(NewThreadPool(num_threads));
   });
@@ -2787,6 +2789,9 @@ struct LevelStats {
   double entry_spike_ratio;
   int entry_spike_count;
   int entry_tail_count;
+  
+  // File number assignment
+  int start_file_num;
 };
 
 struct SST { // - S3
@@ -2943,10 +2948,19 @@ std::vector<LevelStats> LevelStatsFromCsv(const std::string& path) {
     lv_stats.push_back(lvs);
   }
 
+  // Pre-assign file numbers to each level based on sst_count.
+  // Assignment follows L0 to L_max order.
+  int current_global_file_num = 8;
+  for (size_t i = 0; i < lv_stats.size(); ++i) {
+    lv_stats[i].start_file_num = current_global_file_num;
+    current_global_file_num += lv_stats[i].sst_count;
+  }
+
   fprintf(stderr, "[LevelStatsFromCsv] Parsed %zu levels from CSV:\n", lv_stats.size());
   for (const auto& lvs : lv_stats) {
-    fprintf(stderr, "  L%d: sst_count=%d, min_key=%" PRIu64 ", max_key=%" PRIu64 "\n",
-            lvs.level, lvs.sst_count, lvs.level_min, lvs.level_max);
+    fprintf(stderr, "  L%d: sst_count=%d (files %d-%d), min_key=%" PRIu64 ", max_key=%" PRIu64 "\n",
+            lvs.level, lvs.sst_count, lvs.start_file_num, lvs.start_file_num + lvs.sst_count - 1, 
+            lvs.level_min, lvs.level_max);
   }
 
   return lv_stats;
@@ -2969,7 +2983,6 @@ static double sample_weibull(std::mt19937& gen, double shape, double loc, double
 }
 
 std::vector<SST> MakeSSTsFromLevel(const LevelStats& level_row,
-                                   int start_file_number,
                                    const std::string& output_dir,
                                    [[maybe_unused]] uint64_t target_sst_bytes,
                                    [[maybe_unused]] uint64_t key_size,
@@ -2983,8 +2996,8 @@ std::vector<SST> MakeSSTsFromLevel(const LevelStats& level_row,
   int sst_count = level_row.sst_count;
   
   uint64_t seed = ::seed_base.has_value() 
-    ? static_cast<uint64_t>(*::seed_base) + static_cast<uint64_t>(level_row.level) * 1000000 + static_cast<uint64_t>(start_file_number)
-    : static_cast<uint64_t>(start_file_number) * 1000 + static_cast<uint64_t>(level_row.level);
+    ? static_cast<uint64_t>(*::seed_base) + static_cast<uint64_t>(level_row.level) * 1000000 + static_cast<uint64_t>(level_row.start_file_num)
+    : static_cast<uint64_t>(level_row.start_file_num) * 1000 + static_cast<uint64_t>(level_row.level);
   std::mt19937 gen(seed);
 
   std::string dist_model;
@@ -3359,7 +3372,7 @@ std::vector<SST> MakeSSTsFromLevel(const LevelStats& level_row,
     }
 
     SST sst;
-    sst.file_num = start_file_number + static_cast<int>(sst_files.size());
+    sst.file_num = level_row.start_file_num + static_cast<int>(sst_files.size());
     sst.level = level_row.level;
     sst.min_k = range_start;
     sst.max_k = range_end;
@@ -5801,59 +5814,80 @@ class Benchmark {
   }
 
   void S3DoWriteSST([[maybe_unused]]ThreadState* thread, [[maybe_unused]]WriteMode write_mode) {
+    // The ttload workload uses internal parallelism (tt_threads) to handle
+    // the LSM tree reconstruction. Since global state and ingestion order
+    // must be managed by a single coordinator, we enforce FLAGS_threads == 1.
+    if (FLAGS_threads > 1) {
+      fprintf(stderr, "ERROR: ttload workload requires --threads=1. "
+                      "Use --tt_threads for internal parallelism.\n");
+      return;
+    }
+
     Options options = open_options_;
+
+    // Can be optimized - godong
     IngestExternalFileOptions ifo;
     ifo.move_files = false;
 
     int64_t stage = 0;
     size_t id = 0;
 
+    // Create a new Column Family for the ttload run if the database is open.
     if (db_.db != nullptr) {
       db_.CreateNewCf(open_options_, stage);
     }
     DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(id);
-
-    static std::atomic<bool> processing_started(false);
-   
-    bool expected = false;
-    if (!processing_started.compare_exchange_strong(expected, true)) {
-      return; 
-    }
     
+    // === Read level stats from CSV ===
     if (FLAGS_csv_path.empty()) {
       fprintf(stderr, "[S3DoWriteSST] ERROR: --csv_path must be specified\n");
       return;
     }
     
+    // === Prepare level stats ===
+    // This loads the predicted LSM-tree structure (level, number of keys, etc.) from the CSV.
     const std::string csv_path = FLAGS_csv_path;
     std::vector<LevelStats> levels = LevelStatsFromCsv(csv_path);
-
-    int next_file_number = 8;
     
+    // === Set output directory ===
     std::string output_dir = FLAGS_db;
     while (!output_dir.empty() && output_dir.back() == '/') {
       output_dir.pop_back();
     }
 
+    // === Prepare for multi-threaded level ingestion ===
+    // We use a custom ThreadPool to perform parallel SST generation and ingestion.
     ThreadPool* thread_pool = GetS3ThreadPool();
+    
     std::atomic<int> pending_level_jobs(0);
     std::mutex level_completion_mutex;
     std::condition_variable level_completion_cv;
+    
+    // Synchronization primitives to manage dependencies between levels.
+    // In LSM-tree ingestion, we usually populate from bottom to top (L6 down to L0)
+    // to ensure that data in lower levels doesn't trigger unexpected compactions 
+    // or visibility issues during the batch load.
     std::vector<std::condition_variable> level_cvs(levels.size());
     std::vector<std::mutex> level_mutexes(levels.size());
     std::vector<std::atomic<bool>> level_ingest_started(levels.size());
-    std::atomic<int> next_file_number_atomic(next_file_number);
-    std::mutex file_number_mutex;
     
     for (size_t i = 0; i < levels.size(); ++i) {
       level_ingest_started[i].store(false);
     }
     
+    // Submit jobs for each level in reverse order (L_max to L0).
     for (size_t level_idx = levels.size(); level_idx-- > 0; ) {
       const auto& lvl = levels[level_idx];
+      // new level started
       pending_level_jobs++;
       
       thread_pool->SubmitJob([&, level_idx, lvl]() {
+        // [Level Dependency Synchronization]
+        // Upper levels (e.g., L5) must wait until lower levels (e.g., L6) have at least
+        // finished their setup and started ingestion to maintain tree integrity.
+
+        // implemented using level condition variables and mutexes
+        // if L4, wait for L5 to start L5.wait() { return L5.load }
         if (level_idx + 1 < levels.size()) {
           std::unique_lock<std::mutex> prev_lock(level_mutexes[level_idx + 1]);
           level_cvs[level_idx + 1].wait(prev_lock, [&] {
@@ -5861,28 +5895,20 @@ class Benchmark {
           });
         }
 
-        // Calculate base threads once for this level
-        int base_threads = FLAGS_threads > 0 ? FLAGS_threads : 1;
+        // Calculate the number of threads allocated for this level.
+        int base_threads = FLAGS_tt_threads > 0 ? FLAGS_tt_threads : 1;
 
+        // used for target level ingestion
         IngestExternalFileOptions ifo_local = ifo;
         ifo_local.s3_ingest = true;
         ifo_local.s3_target_level = lvl.level;
 
-        int current_file_number;
-        {
-          std::lock_guard<std::mutex> lock(file_number_mutex);
-          current_file_number = next_file_number_atomic.load();
-        }
-        
-        std::vector<SST> ssts = MakeSSTsFromLevel(lvl, current_file_number, output_dir, 
+        // Generate metadata (key ranges, paths) for SST files belonging to this level.
+        std::vector<SST> ssts = MakeSSTsFromLevel(lvl, output_dir, 
                                                    FLAGS_target_file_size_base, FLAGS_key_size, FLAGS_value_size, 
                                                    static_cast<int>(levels.size()), nullptr);
-        
-        {
-          std::lock_guard<std::mutex> lock(file_number_mutex);
-          next_file_number_atomic.store(current_file_number + static_cast<int>(ssts.size()));
-        }
       
+        // Queue up SST tasks for the worker threads to process in parallel.
         std::queue<const SST*> sst_queue;
         std::mutex queue_mutex;
         std::mutex ingest_queue_mutex;
@@ -5895,6 +5921,9 @@ class Benchmark {
           sst_queue.push(&sst);
         }
         
+        // [Parallel SST Generation]
+        // We use multiple threads within the level to generate SST files concurrently.
+        // Higher levels (with more files) or L0 can scale their thread count accordingly.
         int num_sst_threads = base_threads * (lvl.level == 0 ? 1 : lvl.level);
         std::atomic<int> pending_sst_jobs(num_sst_threads);
         std::condition_variable sst_done_cv;
@@ -5921,10 +5950,12 @@ class Benchmark {
               
               {
                 EnvOptions env_opts;
+                // Use direct I/O for SST writing to bypass page cache and stress storage.
                 env_opts.use_direct_writes = true;
                 env_opts.use_direct_reads = true;
                 SstFileWriter sst_file_writer(env_opts, options_local);
                 
+                // Open and write keys to the SST file based on the metadata in 'sst'.
                 s = sst_file_writer.Open(sst_path);
                 if (!s.ok()) {
                   fprintf(stderr, "[Level %d SST Thread %d] Failed to open SST file %s: %s (file_num=%d)\n", 
@@ -5934,6 +5965,7 @@ class Benchmark {
                   continue;
                 }
 
+                // Internal function to populate the writer with keys in the specified range.
                 s = S3WriteKeysToSSTFile(sst, sst_file_writer, gen_local);
                 if (!s.ok()) {
                   fprintf(stderr, "[Level %d SST Thread %d] Failed to write keys to SST file %s: %s (file_num=%d, min_k=%" PRIu64 ", max_k=%" PRIu64 ", num_keys=%" PRIu64 ")\n",
@@ -5950,6 +5982,7 @@ class Benchmark {
                   continue;
                 }
                 
+                // Verify that the file was actually written to disk.
                 uint64_t file_size = 0;
                 Status size_status = Env::Default()->GetFileSize(sst_path, &file_size);
                 if (!size_status.ok() || file_size == 0) {
@@ -5969,6 +6002,7 @@ class Benchmark {
               completed_count++;
             }
             
+            // Notify the level coordinator when this worker thread finishes its tasks.
             {
               std::lock_guard<std::mutex> lock(sst_done_mutex);
               if (--pending_sst_jobs == 0) {
@@ -5978,19 +6012,25 @@ class Benchmark {
           });
         }
         
+        // Wait for all SST files in this level to be generated.
         {
           std::unique_lock<std::mutex> lock(sst_done_mutex);
           sst_done_cv.wait(lock, [&] { return pending_sst_jobs.load() == 0; });
         }
         
+        // Signal the next level (upper level) that it can start its processing.
         if (level_idx > 0) {
           std::lock_guard<std::mutex> lock(level_mutexes[level_idx]);
           level_ingest_started[level_idx].store(true);
           level_cvs[level_idx].notify_all();
         }
         
+        // [Batch Ingestion Phase]
+        // Once the SST files are ready, we ingest them into the live RocksDB instance.
+        // Files are processed in parallel batches.
         if (!ingest_queue.empty()) {
           int num_ingest_threads = base_threads * (lvl.level == 0 ? 1 : lvl.level);
+          // batch size 
           const size_t batch_size = ingest_queue.size() / num_ingest_threads + 1;
           
           std::queue<std::vector<std::string>> ingest_batch_queue;
@@ -5999,6 +6039,7 @@ class Benchmark {
           bool ingest_done = false;
           std::atomic<int> ingested_count(0);
           
+          // Partition the generated files into batches for ingestion.
           std::vector<std::string> current_batch;
           for (size_t i = 0; i < ingest_queue.size(); ++i) {
             current_batch.push_back(ingest_queue[i]);
@@ -6034,6 +6075,8 @@ class Benchmark {
                   continue;
                 }
                 
+                // Call IngestExternalFile with the target level specified.
+                // This manually placed ingestion builds the LSM tree structure directly.
                 Status s = db_with_cfh->db->IngestExternalFile(batch, ifo_local);
                 if (!s.ok()) {
                   fprintf(stderr, "[Level %d Ingest Thread %d] Failed to ingest batch of %zu files: %s\n", 
@@ -6064,6 +6107,7 @@ class Benchmark {
           }
         }
         
+        // Finalize level job and notify the main benchmark thread.
         {
           std::lock_guard<std::mutex> lock(level_completion_mutex);
           if (--pending_level_jobs == 0) {
@@ -6073,13 +6117,14 @@ class Benchmark {
       });
     }
     
+    // Wait for all levels (L6 to L0) to complete their generation and ingestion.
     {
       std::unique_lock<std::mutex> lock(level_completion_mutex);
       level_completion_cv.wait(lock, [&] { return pending_level_jobs.load() == 0; });
     }
     
+    // Cleanup the thread pool.
     thread_pool->WaitForJobsAndJoinAllThreads();
-    processing_started.store(false);
   }
 
   void WriteUniqueRandom(ThreadState* thread) {
