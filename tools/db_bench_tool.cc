@@ -1829,8 +1829,9 @@ static std::once_flag g_thread_pool_init_flag;
 
 static ThreadPool* GetS3ThreadPool() {
   std::call_once(g_thread_pool_init_flag, []() {
-    int base_threads = FLAGS_tt_threads > 0 ? FLAGS_tt_threads : 1;
-    int num_threads = base_threads * 5;  // Max level 5
+    int num_threads = FLAGS_tt_threads > 0 ? FLAGS_tt_threads : 1;
+
+    fprintf(stdout, "[S3ThreadPool] Initializing thread pool with %d threads.\n", num_threads);
     s3_thread_pool.reset(NewThreadPool(num_threads));
   });
   return s3_thread_pool.get();
@@ -2771,635 +2772,326 @@ struct LevelStats {
   int sst_count;
   // kd distribution parameters
   double kd_min, kd_max, kd_q1, kd_q2, kd_q3;
-  double kd_shape;
-  double kd_loc;
-  double kd_scale;
+  double kd_shape, kd_loc, kd_scale;
   // gap distribution parameters
   double gap_min, gap_max, gap_q1, gap_q2, gap_q3;
   double gap_pareto_shape, gap_pareto_scale;
-  // entry distribution parameters (for num_keys sampling)
-  double entry_mean;
-  double entry_std;
+  // entry distribution parameters
+  double entry_mean, entry_std;
   double entry_min, entry_max, entry_q1, entry_q2, entry_q3;
   double entry_weibull_shape, entry_weibull_loc, entry_weibull_scale;
-  // Ln_entry distribution parameters
-  double Ln_entry_mean;
-  // spike and tail sampling parameters
-  double entry_spike_min, entry_spike_max;
-  double entry_spike_ratio;
-  int entry_spike_count;
-  int entry_tail_count;
-  
-  // File number assignment
+  // spike and tail parameters
+  double entry_spike_min, entry_spike_max, entry_spike_ratio;
+  int entry_spike_count, entry_tail_count;
   int start_file_num;
 };
 
-struct SST { // - S3
-  int file_num = 8;
+struct SST {
+  int file_num;
   int level;
-  uint64_t min_k;
-  uint64_t max_k;
-  uint64_t num_keys;
+  uint64_t min_k, max_k, num_keys;
   std::string out_path;
 };
 
 static inline std::string csv_trim(std::string s) {
-  auto wsfront = find_if_not(s.begin(), s.end(), ::isspace);
-  auto wsback  = find_if_not(s.rbegin(), s.rend(), ::isspace).base();
-  if (wsfront >= wsback) return std::string();
-  return std::string(wsfront, wsback);
+  auto wsfront = std::find_if_not(s.begin(), s.end(), ::isspace);
+  auto wsback  = std::find_if_not(s.rbegin(), s.rend(), ::isspace).base();
+  return (wsfront >= wsback) ? "" : std::string(wsfront, wsback);
 }
 
 static std::vector<std::string> split_csv_line(const std::string& line) {
   std::vector<std::string> out;
   std::string cur;
   for (char c : line) {
-    if (c == ',') {
-      out.push_back(csv_trim(cur));
-      cur.clear();
-    } else {
-      cur.push_back(c);
-    }
+    if (c == ',') { out.push_back(csv_trim(cur)); cur.clear(); }
+    else cur.push_back(c);
   }
   out.push_back(csv_trim(cur));
   return out;
 }
 
-static bool to_uint64(const std::string& s, uint64_t& out) {
-  if (s.empty()) { out = 0; return true; }
-  try {
-    double d = stod(s);
-    if (d < 0) { out = 0; return true; }
-    out = static_cast<uint64_t>(d);
-    return true;
-  } catch (...) { out = 0; return false; }
-}
-
-static bool to_int(const std::string& s, int& out) {
-  if (s.empty()) { out = 0; return true; }
-  try {
-    double d = stod(s);
-    out = static_cast<int>(llround(d));
-    return true;
-  } catch (...) { out = 0; return false; }
-}
-
-static bool to_double(const std::string& s, double& out) {
-  if (s.empty()) { out = 0.0; return true; }
-  try { out = stod(s); return true; } catch (...) { out = 0.0; return false; }
-}
+// 타입 변환 래퍼
+static bool to_uint64(const std::string& s, uint64_t& out) { try { out = (s.empty()) ? 0 : static_cast<uint64_t>(std::stod(s)); return true; } catch(...) { return false; } }
+static bool to_int(const std::string& s, int& out) { try { out = (s.empty()) ? 0 : static_cast<int>(std::llround(std::stod(s))); return true; } catch(...) { return false; } }
+static bool to_double(const std::string& s, double& out) { try { out = (s.empty()) ? 0.0 : std::stod(s); return true; } catch(...) { return false; } }
 
 std::vector<LevelStats> LevelStatsFromCsv(const std::string& path) {
-  std::ifstream f(path); 
-  if (!f.is_open()) {
-    fprintf(stderr, "Failed to open CSV file: %s\n", path.c_str());
-  }
-  
+  std::ifstream f(path);
+  if (!f.is_open()) return {};
+
   std::string header_line, data_line;
-  if (!getline(f, header_line)) {
-    fprintf(stderr, "CSV file is empty: %s\n", path.c_str());
-  }
-  if (!getline(f, data_line)) {
-    fprintf(stderr, "CSV file has only header line: %s\n", path.c_str());
-  }
-  
-  std::vector<std::string> headers = split_csv_line(header_line);
-  std::vector<std::string> values  = split_csv_line(data_line);
+  if (!getline(f, header_line) || !getline(f, data_line)) return {};
 
-  std::unordered_map<std::string,std::string> col;
-  for (size_t i = 1; i < headers.size(); ++i) {
-    col[headers[i]] = (i < values.size() ? values[i] : "");
-  }
+  auto headers = split_csv_line(header_line);
+  auto values = split_csv_line(data_line);
+  std::unordered_map<std::string, std::string> col;
+  for (size_t i = 0; i < headers.size(); ++i) col[headers[i]] = (i < values.size() ? values[i] : "");
 
-  int max_header_level = -1;
+  // 최대 레벨 찾기
+  int max_level = -1;
   std::regex re("^L(\\d+)_");
-  std::smatch m;
   for (const auto& kv : col) {
-    if (std::regex_search(kv.first, m, re)) {
-      max_header_level = std::max(max_header_level, std::stoi(m[1].str()));
-    }
+    std::smatch m;
+    if (std::regex_search(kv.first, m, re)) max_level = std::max(max_level, std::stoi(m[1].str()));
   }
 
   int l0_count = 0;
-  if (col.count("L0_count"))
-    to_int(col["L0_count"], l0_count);
-
-  std::vector<int> levels;
-  if (l0_count == 0) {
-    for (int i = 1; i <= max_header_level; ++i) levels.push_back(i);
-  } else {
-    for (int i = 0; i <= max_header_level; ++i) levels.push_back(i);
-  }
-
-  auto get = [&](const std::string& key) -> std::string {
-    auto it = col.find(key);
-    return (it == col.end()) ? "" : it->second;
-  };
+  to_int(col["L0_count"], l0_count);
 
   std::vector<LevelStats> lv_stats;
-  lv_stats.reserve(levels.size());
-  for (int lvl : levels) {
+  int current_file_num = 8;
+
+  for (int lvl = (l0_count > 0 ? 0 : 1); lvl <= max_level; ++lvl) {
     const std::string p = "L" + std::to_string(lvl) + "_";
     LevelStats lvs;
     lvs.level = lvl;
-    to_int(get(p + "count"), lvs.sst_count);
-    to_uint64(get(p + "min_key"), lvs.level_min);
-    to_uint64(get(p + "max_key"), lvs.level_max);
-    to_double(get(p + "kd_mean"),  lvs.kd_mean);
-    to_double(get(p + "kd_std"),   lvs.kd_std);
-    to_double(get(p + "gap_mean"), lvs.gap_mean);
-    to_double(get(p + "gap_std"),  lvs.gap_std);
-    // kd distribution parameters
-    to_double(get(p + "kd_min"), lvs.kd_min);
-    to_double(get(p + "kd_max"), lvs.kd_max);
-    to_double(get(p + "kd_q1"), lvs.kd_q1);
-    to_double(get(p + "kd_q2"), lvs.kd_q2);
-    to_double(get(p + "kd_q3"), lvs.kd_q3);
-    to_double(get(p + "kd_shape"), lvs.kd_shape);
-    to_double(get(p + "kd_loc"), lvs.kd_loc);
-    to_double(get(p + "kd_scale"), lvs.kd_scale);
-    // gap distribution parameters
-    to_double(get(p + "gap_min"), lvs.gap_min);
-    to_double(get(p + "gap_max"), lvs.gap_max);
-    to_double(get(p + "gap_q1"), lvs.gap_q1);
-    to_double(get(p + "gap_q2"), lvs.gap_q2);
-    to_double(get(p + "gap_q3"), lvs.gap_q3);
-    to_double(get(p + "gap_pareto_shape"), lvs.gap_pareto_shape);
-    to_double(get(p + "gap_pareto_scale"), lvs.gap_pareto_scale);
-    // entry distribution parameters
-    to_double(get(p + "entry_mean"), lvs.entry_mean);
-    to_double(get(p + "entry_std"), lvs.entry_std);
-    to_double(get(p + "entry_min"), lvs.entry_min);
-    to_double(get(p + "entry_max"), lvs.entry_max);
-    to_double(get(p + "entry_q1"), lvs.entry_q1);
-    to_double(get(p + "entry_q2"), lvs.entry_q2);
-    to_double(get(p + "entry_q3"), lvs.entry_q3);
-    to_double(get(p + "entry_weibull_shape"), lvs.entry_weibull_shape);
-    to_double(get(p + "entry_weibull_loc"), lvs.entry_weibull_loc);
-    to_double(get(p + "entry_weibull_scale"), lvs.entry_weibull_scale);
-    // Ln_entry distribution parameters
-    to_double(get(p + "Ln_entry_mean"), lvs.Ln_entry_mean);
-    // spike and tail sampling parameters
-    to_double(get(p + "entry_spike_min"), lvs.entry_spike_min);
-    to_double(get(p + "entry_spike_max"), lvs.entry_spike_max);
-    to_double(get(p + "entry_spike_ratio"), lvs.entry_spike_ratio);
-    to_int(get(p + "entry_spike_count"), lvs.entry_spike_count);
-    to_int(get(p + "entry_tail_count"), lvs.entry_tail_count);
+    
+    auto get = [&](const std::string& suffix) { return col.count(p + suffix) ? col[p + suffix] : ""; };
+
+    to_int(get("count"), lvs.sst_count);
+    to_uint64(get("min_key"), lvs.level_min);
+    to_uint64(get("max_key"), lvs.level_max);
+    to_double(get("kd_mean"), lvs.kd_mean); to_double(get("kd_std"), lvs.kd_std);
+    to_double(get("kd_min"), lvs.kd_min);   to_double(get("kd_max"), lvs.kd_max);
+    to_double(get("kd_q1"), lvs.kd_q1);     to_double(get("kd_q2"), lvs.kd_q2); to_double(get("kd_q3"), lvs.kd_q3);
+    to_double(get("kd_shape"), lvs.kd_shape); to_double(get("kd_loc"), lvs.kd_loc); to_double(get("kd_scale"), lvs.kd_scale);
+
+    to_double(get("gap_mean"), lvs.gap_mean); to_double(get("gap_std"), lvs.gap_std);
+    to_double(get("gap_min"), lvs.gap_min);   to_double(get("gap_max"), lvs.gap_max);
+    to_double(get("gap_q1"), lvs.gap_q1);     to_double(get("gap_q2"), lvs.gap_q2); to_double(get("gap_q3"), lvs.gap_q3);
+    to_double(get("gap_pareto_shape"), lvs.gap_pareto_shape); to_double(get("gap_pareto_scale"), lvs.gap_pareto_scale);
+
+    to_double(get("entry_mean"), lvs.entry_mean); to_double(get("entry_std"), lvs.entry_std);
+    to_double(get("entry_min"), lvs.entry_min);   to_double(get("entry_max"), lvs.entry_max);
+    to_double(get("entry_weibull_shape"), lvs.entry_weibull_shape); 
+    to_double(get("entry_weibull_loc"), lvs.entry_weibull_loc);
+    to_double(get("entry_weibull_scale"), lvs.entry_weibull_scale);
+    
+    to_double(get("entry_spike_min"), lvs.entry_spike_min); to_double(get("entry_spike_max"), lvs.entry_spike_max);
+    to_int(get("entry_spike_count"), lvs.entry_spike_count); to_int(get("entry_tail_count"), lvs.entry_tail_count);
+
+    lvs.start_file_num = current_file_num;
+    current_file_num += lvs.sst_count;
     lv_stats.push_back(lvs);
   }
 
-  // Pre-assign file numbers to each level based on sst_count.
-  // Assignment follows L0 to L_max order.
-  int current_global_file_num = 8;
-  for (size_t i = 0; i < lv_stats.size(); ++i) {
-    lv_stats[i].start_file_num = current_global_file_num;
-    current_global_file_num += lv_stats[i].sst_count;
-  }
-
-  fprintf(stderr, "[LevelStatsFromCsv] Parsed %zu levels from CSV:\n", lv_stats.size());
+  // --- [DEBUG] CSV 파싱 결과 출력 로그 ---
+  fprintf(stderr, "\n================================================================================\n");
+  fprintf(stderr, "[TTLoad] CSV Parsing Summary: Found %zu Levels\n", lv_stats.size());
+  fprintf(stderr, "--------------------------------------------------------------------------------\n");
+  fprintf(stderr, "%-5s | %-10s | %-15s | %-15s | %-10s\n", "Lvl", "SST Count", "Min Key", "Max Key", "Start File");
+  fprintf(stderr, "--------------------------------------------------------------------------------\n");
+  
   for (const auto& lvs : lv_stats) {
-    fprintf(stderr, "  L%d: sst_count=%d (files %d-%d), min_key=%" PRIu64 ", max_key=%" PRIu64 "\n",
-            lvs.level, lvs.sst_count, lvs.start_file_num, lvs.start_file_num + lvs.sst_count - 1, 
-            lvs.level_min, lvs.level_max);
+    fprintf(stderr, "L%-4d | %-10d | %-15" PRIu64 " | %-15" PRIu64 " | %-10d\n",
+        lvs.level, lvs.sst_count, lvs.level_min, lvs.level_max, lvs.start_file_num);
+    
+    // 상세 분포 파라미터 출력 (필요 시 주석 해제하여 확인)
+    fprintf(stderr, "      > [KD]    Mean: %-6.2f, Std: %-6.2f, Shape: %-6.2f, Scale: %-6.2f\n",
+            lvs.kd_mean, lvs.kd_std, lvs.kd_shape, lvs.kd_scale);
+    fprintf(stderr, "      > [Gap]   Mean: %-6.2f, P-Shape: %-6.2f, P-Scale: %-6.2f\n",
+            lvs.gap_mean, lvs.gap_pareto_shape, lvs.gap_pareto_scale);
+    fprintf(stderr, "      > [Entry] Mean: %-6.2f, W-Shape: %-6.2f, W-Scale: %-6.2f, Spike: %d\n",
+            lvs.entry_mean, lvs.entry_weibull_shape, lvs.entry_weibull_scale, lvs.entry_spike_count);
+    fprintf(stderr, "--------------------------------------------------------------------------------\n");
   }
+  fprintf(stderr, "================================================================================\n\n");
+  // --- [DEBUG] 끝 ---
 
   return lv_stats;
 }
 
 static double sample_fisk(std::mt19937& gen, double shape, double scale) {
-  if (shape <= 0 || scale <= 0) return 1.0;
-  std::uniform_real_distribution<double> uniform(0.000001, 0.999999);
-  double u = uniform(gen);
-  double ratio = u / (1.0 - u);
-  return scale * std::pow(ratio, 1.0 / shape);
+  std::uniform_real_distribution<double> dist(1e-6, 1.0 - 1e-6);
+  double u = dist(gen);
+  return scale * std::pow(u / (1.0 - u), 1.0 / shape);
 }
 
 static double sample_weibull(std::mt19937& gen, double shape, double loc, double scale) {
-  if (shape <= 0 || scale <= 0) return 1.0;
-  std::uniform_real_distribution<double> uniform(0.000001, 0.999999);
-  double u = uniform(gen);
-  double sample = loc + scale * std::pow(-std::log(1.0 - u), 1.0 / shape);
-  return std::max(1.0, sample);
+  std::uniform_real_distribution<double> dist(1e-6, 1.0 - 1e-6);
+  return loc + scale * std::pow(-std::log(1.0 - dist(gen)), 1.0 / shape);
 }
 
-std::vector<SST> MakeSSTsFromLevel(const LevelStats& level_row,
-                                   const std::string& output_dir,
-                                   [[maybe_unused]] uint64_t target_sst_bytes,
-                                   [[maybe_unused]] uint64_t key_size,
-                                   [[maybe_unused]] uint64_t value_size,
-                                   int total_levels,
-                                   [[maybe_unused]] const std::vector<uint64_t>* log_kv_counts) {
-  std::vector<SST> sst_files;
-  if (level_row.sst_count <= 0) return sst_files;
+// 사분위수 보정 로직 (기존 로직 유지)
+void adjust_samples(std::vector<double>& samples, double v_min, double v_q1, double v_q2, double v_q3, double v_max, double v_mean, double v_std) {
+  if (samples.empty()) return;
+  size_t n = samples.size();
 
-  uint64_t total_range = level_row.level_max - level_row.level_min + 1;
-  int sst_count = level_row.sst_count;
-  
-  uint64_t seed = ::seed_base.has_value() 
-    ? static_cast<uint64_t>(*::seed_base) + static_cast<uint64_t>(level_row.level) * 1000000 + static_cast<uint64_t>(level_row.start_file_num)
-    : static_cast<uint64_t>(level_row.start_file_num) * 1000 + static_cast<uint64_t>(level_row.level);
+  if (v_q1 > 0 && v_q2 > 0 && v_q3 > 0) {
+    std::vector<double> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+    for (size_t i = 0; i < samples.size(); ++i) {
+      auto it = std::lower_bound(sorted.begin(), sorted.end(), samples[i]);
+      double p = n > 1 ? static_cast<double>(std::distance(sorted.begin(), it)) / (n - 1) : 0.5;
+      double s;
+      if (p <= 0.25)      s = v_min + (p / 0.25) * (v_q1 - v_min);
+      else if (p <= 0.5)  s = v_q1 + ((p - 0.25) / 0.25) * (v_q2 - v_q1);
+      else if (p <= 0.75) s = v_q2 + ((p - 0.5) / 0.25) * (v_q3 - v_q2);
+      else                s = v_q3 + ((p - 0.75) / 0.25) * (v_max - v_q3);
+      samples[i] = std::max(v_min, std::min(v_max, s));
+    }
+  } else if (v_std > 0 && v_mean > 0) {
+    fprintf(stderr, "Adjusting samples to mean %.2f and std %.2f\n", v_mean, v_std);
+    double sum = 0;
+    for (double s : samples) sum += s;
+    double m_act = sum / n;
+    double sq_sum = 0;
+    for (double s : samples) sq_sum += (s - m_act) * (s - m_act);
+    double s_act = std::sqrt(sq_sum / (n > 1 ? n - 1 : 1));
+    double scale = (s_act > 0) ? v_std / s_act : 1.0;
+    for (double& s : samples) s = std::max(v_min, std::min(v_max, (s - m_act) * scale + v_mean));
+  }
+}
+
+std::vector<SST> MakeSSTsFromLevel(const LevelStats& lvs, const std::string& base_path) {
+  if (lvs.sst_count <= 0) return {};
+
+  uint64_t seed = static_cast<uint64_t>(lvs.start_file_num) * 1000 + lvs.level;
   std::mt19937 gen(seed);
+  int n = lvs.sst_count;
 
-  std::string dist_model;
-  int level = level_row.level;
-  if (level == 1) {
-    dist_model = "none";
-  } else if (level == 2) {
-    dist_model = "uniform";
-  } else if (level >= 3 && level < total_levels) {
-    dist_model = "fisk";
-  } else if (level == total_levels) {
-    //dist_model = "lognormal";
-    dist_model = "fisk";
-  }
-
+  // 1. KD 샘플링 (Fisk)
   std::vector<double> kd_samples;
-  kd_samples.reserve(sst_count);
-
-  if (dist_model == "none" || level_row.level == 1) {
-    if (level_row.kd_q1 > 0 && level_row.kd_q2 > 0 && level_row.kd_q3 > 0) {
-      std::uniform_real_distribution<double> uniform(0.0, 1.0);
-      for (int i = 0; i < sst_count; ++i) {
-        double percentile = (sst_count > 1) ? static_cast<double>(i) / (sst_count - 1) : 0.5;
-        percentile += (uniform(gen) - 0.5) * 0.1;
-        percentile = std::max(0.0, std::min(1.0, percentile));
-        
-        double kd_value;
-        if (percentile <= 0.25) {
-          kd_value = level_row.kd_min + (percentile / 0.25) * (level_row.kd_q1 - level_row.kd_min);
-        } else if (percentile <= 0.5) {
-          kd_value = level_row.kd_q1 + ((percentile - 0.25) / 0.25) * (level_row.kd_q2 - level_row.kd_q1);
-        } else if (percentile <= 0.75) {
-          kd_value = level_row.kd_q2 + ((percentile - 0.5) / 0.25) * (level_row.kd_q3 - level_row.kd_q2);
-        } else {
-          kd_value = level_row.kd_q3 + ((percentile - 0.75) / 0.25) * (level_row.kd_max - level_row.kd_q3);
-        }
-        kd_samples.push_back(std::max(level_row.kd_min, std::min(level_row.kd_max, kd_value)));
-      }
-    } else if (level_row.kd_std > 0 && level_row.kd_mean > 0) {
-      std::normal_distribution<double> normal_dist(level_row.kd_mean, level_row.kd_std);
-      for (int i = 0; i < sst_count; ++i) {
-        double kd_value = normal_dist(gen);
-        kd_value = std::max(level_row.kd_min, std::min(level_row.kd_max, kd_value));
-        kd_samples.push_back(kd_value);
-      }
-    } 
-  } else if (dist_model == "uniform" || level_row.level == 2) {
-    double kd_min = level_row.kd_loc > 0 ? level_row.kd_loc : (level_row.kd_min > 0 ? level_row.kd_min : 1.0);
-    double kd_max_from_scale = level_row.kd_scale > 0 ? (kd_min + level_row.kd_scale) : 0.0;
-    double kd_max = 0.0;
-    
-    if (kd_max_from_scale > 0 && level_row.kd_max > 0) {
-      kd_max = std::min(kd_max_from_scale, level_row.kd_max);
-    } else if (kd_max_from_scale > 0) {
-      kd_max = kd_max_from_scale;
-    } else if (level_row.kd_max > 0) {
-      kd_max = level_row.kd_max;
-    } else {
-      kd_max = kd_min + 1.0;
-    }
-    
-    if (level_row.kd_min > 0 && level_row.kd_min > kd_min) {
-      kd_min = level_row.kd_min;
-    }
-    
-    std::uniform_real_distribution<double> uniform_dist(kd_min, kd_max);
-    for (int i = 0; i < sst_count; ++i) {
-      kd_samples.push_back(uniform_dist(gen));
-    }
-  } else if (dist_model == "fisk") {
-    double shape = level_row.kd_shape > 0 ? level_row.kd_shape : 1.0;
-    double scale = level_row.kd_scale > 0 ? level_row.kd_scale : (level_row.kd_mean > 0 ? level_row.kd_mean : 1.0);
-    
-    double kd_min = level_row.kd_min > 0 ? level_row.kd_min : 0.0;
-    double kd_max = level_row.kd_max > 0 ? level_row.kd_max : std::numeric_limits<double>::max();
-    
-    for (int i = 0; i < sst_count; ++i) {
-      double sample = sample_fisk(gen, shape, scale);
-      if (kd_min > 0) sample = std::max(kd_min, sample);
-      if (kd_max < std::numeric_limits<double>::max()) sample = std::min(kd_max, sample);
-      kd_samples.push_back(sample);
-    }
-  } else if (dist_model == "lognormal" || level_row.level == total_levels) {
-    double kd_shape = level_row.kd_shape > 0 ? level_row.kd_shape : 1.0;
-    double kd_scale = level_row.kd_scale > 0 ? level_row.kd_scale : (level_row.kd_mean > 0 ? level_row.kd_mean : 1.0);
-    
-    double kd_lognorm_m, kd_lognorm_s;
-    
-    if (level_row.kd_mean > 0 && level_row.kd_std > 0) {
-      double mean = level_row.kd_mean;
-      double std = level_row.kd_std;
-      double variance = std * std;
-      kd_lognorm_m = std::log(mean * mean / std::sqrt(variance + mean * mean));
-      kd_lognorm_s = std::sqrt(std::log(1.0 + variance / (mean * mean)));
-    } else {
-      kd_lognorm_m = std::log(kd_scale);
-      kd_lognorm_s = kd_shape;
-    }
-    
-    std::lognormal_distribution<double> kd_dist(kd_lognorm_m, kd_lognorm_s);
-    
-    double kd_min = level_row.kd_min > 0 ? level_row.kd_min : 0.0;
-    double kd_max = level_row.kd_max > 0 ? level_row.kd_max : std::numeric_limits<double>::max();
-    
-    for (int i = 0; i < sst_count; ++i) {
-      double sample = kd_dist(gen);
-      if (kd_min > 0) sample = std::max(kd_min, sample);
-      if (kd_max < std::numeric_limits<double>::max()) sample = std::min(kd_max, sample);
-      kd_samples.push_back(sample);
-    }
+  if (lvs.level <= 2) {
+    double k_min = std::max(1.0, lvs.kd_min); 
+    double k_max = std::max(k_min, lvs.kd_max);
+    std::uniform_real_distribution<double> dist(k_min, k_max);
+    for (int i = 0; i < n; ++i) kd_samples.push_back(dist(gen));
   } else {
-    double kd_min = level_row.kd_min > 0 ? level_row.kd_min : 1.0;
-    double kd_max = level_row.kd_max > 0 ? level_row.kd_max : 2.0;
-    std::uniform_real_distribution<double> uniform_dist(kd_min, kd_max);
-    for (int i = 0; i < sst_count; ++i) {
-      kd_samples.push_back(uniform_dist(gen));
+    for (int i = 0; i < n; ++i) {
+      double val = sample_fisk(gen, lvs.kd_shape, lvs.kd_scale);
+      kd_samples.push_back(std::max(1.0, val));
     }
   }
-
+  adjust_samples(kd_samples, lvs.kd_min, lvs.kd_q1, lvs.kd_q2, lvs.kd_q3, lvs.kd_max, lvs.kd_mean, lvs.kd_std);
+  
+  // 2. Gap 샘플링 (Pareto)
   std::vector<double> gap_samples;
-  if (sst_count > 1) {
-    gap_samples.reserve(sst_count - 1);
-    double gap_pareto_shape = level_row.gap_pareto_shape > 0 ? level_row.gap_pareto_shape : 1.0;
-    double gap_pareto_scale = level_row.gap_pareto_scale > 0 ? level_row.gap_pareto_scale : (level_row.gap_min > 0 ? level_row.gap_min : 1.0);
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
-    for (int i = 0; i < sst_count - 1; ++i) {
-      double u = std::min(0.999999, uniform(gen));
-      gap_samples.push_back(gap_pareto_scale / std::pow(1.0 - u, 1.0 / gap_pareto_shape));
-    }
-  }
+  std::uniform_real_distribution<double> dist(0.0, 1.0);
+  for (int i = 0; i < n - 1; ++i) gap_samples.push_back(lvs.gap_pareto_scale / std::pow(1.0 - dist(gen), 1.0 / lvs.gap_pareto_shape));
+  adjust_samples(gap_samples, lvs.gap_min, lvs.gap_q1, lvs.gap_q2, lvs.gap_q3, lvs.gap_max, lvs.gap_mean, lvs.gap_std);
 
-  auto adjust = [](std::vector<double>& samples, double v_min, double v_q1, double v_q2, double v_q3, double v_max, double v_mean, double v_std) {
-    if (samples.empty()) return;
-    int n = samples.size();
-    if (v_q1 > 0 && v_q2 > 0 && v_q3 > 0) {
-      std::vector<double> sorted = samples;
-      std::sort(sorted.begin(), sorted.end());
-      std::vector<double> original = samples;
-      
-      bool all_same = true;
-      for (size_t i = 1; i < sorted.size(); ++i) {
-        if (std::abs(sorted[i] - sorted[0]) > 1e-10) {
-          all_same = false;
-          break;
-        }
-      }
-      
-      if (all_same && n > 1) {
-        for (size_t i = 0; i < original.size(); ++i) {
-          double percentile = static_cast<double>(i) / (n - 1);
-          double s;
-          if (percentile <= 0.25) s = v_min + (percentile / 0.25) * (v_q1 - v_min);
-          else if (percentile <= 0.5) s = v_q1 + ((percentile - 0.25) / 0.25) * (v_q2 - v_q1);
-          else if (percentile <= 0.75) s = v_q2 + ((percentile - 0.5) / 0.25) * (v_q3 - v_q2);
-          else s = v_q3 + ((percentile - 0.75) / 0.25) * (v_max - v_q3);
-          samples[i] = std::max(v_min, std::min(v_max, s));
-        }
-      } else {
-        for (size_t i = 0; i < original.size(); ++i) {
-          auto it = std::lower_bound(sorted.begin(), sorted.end(), original[i]);
-          double percentile = n > 1 ? static_cast<double>(std::distance(sorted.begin(), it)) / (n - 1) : 0.0;
-          double s;
-          if (percentile <= 0.25) s = v_min + (percentile / 0.25) * (v_q1 - v_min);
-          else if (percentile <= 0.5) s = v_q1 + ((percentile - 0.25) / 0.25) * (v_q2 - v_q1);
-          else if (percentile <= 0.75) s = v_q2 + ((percentile - 0.5) / 0.25) * (v_q3 - v_q2);
-          else s = v_q3 + ((percentile - 0.75) / 0.25) * (v_max - v_q3);
-          samples[i] = std::max(v_min, std::min(v_max, s));
-        }
-      }
-    } else if (v_std > 0 && v_mean > 0) {
-      double sum = 0, sq_sum = 0;
-      for (double s : samples) sum += s;
-      double mean_actual = sum / n;
-      for (double s : samples) sq_sum += (s - mean_actual) * (s - mean_actual);
-      double std_actual = std::sqrt(sq_sum / (n > 1 ? n - 1 : 1));
-      double scale = (std_actual > 0) ? v_std / std_actual : 1.0;
-      for (double& s : samples) {
-        s = (s - mean_actual) * scale + v_mean;
-        s = std::max(v_min, std::min(v_max, s));
-      }
-    }
-    for (double& s : samples) {
-      s = std::max(v_min, std::min(v_max, s));
-    }
-  };
-
-  adjust(kd_samples, 1.0, 
-         level_row.kd_q1, level_row.kd_q2, level_row.kd_q3, 
-         level_row.kd_max > 0 ? level_row.kd_max : std::numeric_limits<double>::max(),
-         level_row.kd_mean, level_row.kd_std);
-  
-  adjust(gap_samples, level_row.gap_min, level_row.gap_q1, level_row.gap_q2, level_row.gap_q3, 
-         level_row.gap_max > 0 ? level_row.gap_max : std::numeric_limits<double>::max(),
-         level_row.gap_mean, level_row.gap_std);
-
+  // 3. Entry 샘플링 (Spike + Weibull)
   std::vector<uint64_t> entry_samples;
-  entry_samples.reserve(static_cast<size_t>(sst_count));
-  
-  int spike_count = level_row.entry_spike_count > 0 ? level_row.entry_spike_count : 0;
-  int tail_count = level_row.entry_tail_count > 0 ? level_row.entry_tail_count : 0;
-  
-  if (spike_count + tail_count > sst_count) {
-    double ratio = static_cast<double>(sst_count) / (spike_count + tail_count);
-    spike_count = static_cast<int>(std::llround(spike_count * ratio));
-    tail_count = sst_count - spike_count;
+  for (int i = 0; i < lvs.entry_spike_count && i < n; ++i) {
+    std::uniform_real_distribution<double> spike_dist(lvs.entry_spike_min, lvs.entry_spike_max);
+    entry_samples.push_back(std::max((uint64_t)1, static_cast<uint64_t>(std::llround(spike_dist(gen)))));
   }
-  
-  if (spike_count == 0 && tail_count == 0) {
-    tail_count = sst_count;
+  while ((int)entry_samples.size() < n) {
+    double s = sample_weibull(gen, lvs.entry_weibull_shape, lvs.entry_weibull_loc, lvs.entry_weibull_scale);
+    entry_samples.push_back(std::max((uint64_t)1, static_cast<uint64_t>(std::round(s))));
   }
-  
-  double spike_min = level_row.entry_spike_min > 0 ? level_row.entry_spike_min : 1.0;
-  double spike_max = level_row.entry_spike_max > 0 ? level_row.entry_spike_max : spike_min;
-  if (spike_max < spike_min) spike_max = spike_min;
-  
-  std::uniform_real_distribution<double> spike_dist(spike_min, spike_max);
-  for (int i = 0; i < spike_count; ++i) {
-    double sample = spike_dist(gen);
-    uint64_t entry_val = static_cast<uint64_t>(std::llround(sample));
-    if (entry_val < 1) entry_val = 1;
-    entry_samples.push_back(entry_val);
-  }
-  
-  if (tail_count > 0 && level_row.entry_weibull_shape > 0 && level_row.entry_weibull_scale > 0) {
-    for (int i = 0; i < tail_count; ++i) {
-      double sample = sample_weibull(gen, level_row.entry_weibull_shape, 
-                                      level_row.entry_weibull_loc, 
-                                      level_row.entry_weibull_scale);
-      uint64_t entry_val = static_cast<uint64_t>(std::llround(sample));
-      if (entry_val < 1) entry_val = 1;
-      if (level_row.entry_max > 0 && entry_val > static_cast<uint64_t>(level_row.entry_max)) {
-        entry_val = static_cast<uint64_t>(level_row.entry_max);
-      }
-      if (level_row.entry_min > 0 && entry_val < static_cast<uint64_t>(level_row.entry_min)) {
-        entry_val = static_cast<uint64_t>(level_row.entry_min);
-      }
-      entry_samples.push_back(entry_val);
-    }
-  } else if (tail_count > 0) {
-    for (int i = 0; i < tail_count; ++i) {
-      double sample = sample_weibull(gen, 1.0, 0.0, 1.0);
-      uint64_t entry_val = static_cast<uint64_t>(std::llround(sample));
-      if (entry_val < 1) entry_val = 1;
-      entry_samples.push_back(entry_val);
-    }
-  }
-  
-  while (static_cast<int>(entry_samples.size()) < sst_count) {
-    uint64_t default_val = 1;
-    if (level_row.entry_mean > 0) {
-      default_val = static_cast<uint64_t>(std::llround(level_row.entry_mean));
-      if (default_val < 1) default_val = 1;
-    }
-    entry_samples.push_back(default_val);
-  }
-  
-  if (static_cast<int>(entry_samples.size()) != sst_count) {
-    while (static_cast<int>(entry_samples.size()) < sst_count) {
-      uint64_t default_val = 1;
-      if (level_row.entry_mean > 0) {
-        default_val = static_cast<uint64_t>(std::llround(level_row.entry_mean));
-        if (default_val < 1) default_val = 1;
-      }
-      entry_samples.push_back(default_val);
-    }
-    if (static_cast<int>(entry_samples.size()) > sst_count) {
-      entry_samples.resize(static_cast<size_t>(sst_count));
-    }
-  }
-  
   std::shuffle(entry_samples.begin(), entry_samples.end(), gen);
 
-  uint64_t total_gap = 0;
-  for (double gap : gap_samples) total_gap += static_cast<uint64_t>(std::llround(gap));
-  
-  std::vector<uint64_t> widths(static_cast<size_t>(sst_count), 1);
-  for (int i = 0; i < sst_count; ++i) {
-    double kd = (i < static_cast<int>(kd_samples.size())) ? kd_samples[i] : 1.0;
-    uint64_t entry = (i < static_cast<int>(entry_samples.size())) ? entry_samples[i] : 1;
-    double width_double = kd * static_cast<double>(entry);
-    widths[i] = static_cast<uint64_t>(std::llround(width_double));
-    if (widths[i] < 1) widths[i] = 1;  
-  }
-  
-  uint64_t total_widths = 0;
-  for (uint64_t w : widths) total_widths += w;
-  
-  uint64_t total_needed = total_gap + total_widths;
-  if (total_needed > total_range && total_needed > 0) {
-    uint64_t max_allowed_widths = total_range;  
-    if (total_widths <= max_allowed_widths) {
-      double gap_scale = (total_gap > 0) ? 
-        static_cast<double>(total_range - total_widths) / static_cast<double>(total_gap) : 0.0;
-      if (gap_scale < 0.0) gap_scale = 0.0;
-      
-      for (double& gap : gap_samples) {
-        gap *= gap_scale;
-      }
-    } else {
-      for (double& gap : gap_samples) {
-        gap = 0.0;
-      }
-      
-      double kd_scale = static_cast<double>(total_range) / static_cast<double>(total_widths);
-      
-      for (int i = 0; i < sst_count; ++i) {
-        if (i < static_cast<int>(kd_samples.size())) {
-          kd_samples[i] *= kd_scale;
-          if (kd_samples[i] < 1.0) kd_samples[i] = 1.0; 
-        }
-      }
-      
-      for (int i = 0; i < sst_count; ++i) {
-        double kd = (i < static_cast<int>(kd_samples.size())) ? kd_samples[i] : 1.0;
-        uint64_t entry = (i < static_cast<int>(entry_samples.size())) ? entry_samples[i] : 1;
-        double width_double = kd * static_cast<double>(entry);
-        widths[i] = static_cast<uint64_t>(std::llround(width_double));
-        if (widths[i] < 1) widths[i] = 1;
-      }
-    }
+  // final widths and keys
+  std::vector<uint64_t> final_widths(n);
+  std::vector<uint64_t> final_keys(n);
     
-    total_gap = 0;
-    for (double gap : gap_samples) total_gap += static_cast<uint64_t>(std::llround(gap));
-    total_widths = 0;
-    for (uint64_t w : widths) total_widths += w;
+  // =============================================================
+  // step 1: calculate ideal widths and keys
+  uint64_t sum_keys = 0;
+  uint64_t sum_width = 0;
+  uint64_t sum_gap = 0;
+
+  for (int i = 0; i < n; ++i) {
+    final_keys[i] = entry_samples[i]; // 이미 1 이상 보장됨
+    
+    // KD >= 1.0 이고 Keys >= 1 이므로 Width >= Keys 가 자동으로 성립됨
+    double w = kd_samples[i] * (double)final_keys[i]; 
+    final_widths[i] = static_cast<uint64_t>(std::llround(w));    
+    if (final_widths[i] < final_keys[i]) final_widths[i] = final_keys[i];
+
+    sum_keys += final_keys[i];
+    sum_width += final_widths[i];
+  }
+  for(double g : gap_samples) sum_gap += (uint64_t)g;
+  // =============================================================
+
+
+  // =============================================================
+  // step 2: manage space based on total available space
+  uint64_t total_space = lvs.level_max - lvs.level_min + 1;
+
+  // Case 1: Key 개수만으로도 넘치는 경우 -> Key와 Width 모두 줄임
+  // Width = Key (KD = 1) 으로 강제
+  // Gap도 전부 0으로 만듦
+  // 최악의 상황이지만 사실상 불가능한 시나리오
+  if (sum_keys > total_space) {
+    fprintf(stderr, "[TTLoad] Level %d: Total Keys (%" PRIu64 ") exceed available space (%" PRIu64 "). Compressing Keys and Widths.\n",
+            lvs.level, sum_keys, total_space);
+    double scale = (double)total_space / (double)sum_keys;
+    for (int i = 0; i < n; ++i) {
+      final_keys[i] = std::max((uint64_t)1, static_cast<uint64_t>(final_keys[i] * scale));
+      final_widths[i] = final_keys[i]; // KD = 1
+    }
+    std::fill(gap_samples.begin(), gap_samples.end(), 0.0);
   }
 
-  uint64_t current_key = level_row.level_min;
-  
-  for (int i = 0; i < sst_count; ++i) {
-    if (current_key > level_row.level_max) {
-      //fprintf(stderr, "[MakeSSTsFromLevel] L%d: ERROR at i=%d/%d: current_key=%" PRIu64 " > level_max=%" PRIu64 " - STOPPING\n",
-      //        level_row.level, i, sst_count, current_key, level_row.level_max);
-      break;
-    }
-    
-    uint64_t range_start = current_key;
-    uint64_t range_end;
-    uint64_t num_keys = (i < static_cast<int>(entry_samples.size())) ? entry_samples[i] : 1;
-    if (num_keys == 0) num_keys = 1;
+  // Case 2: Width는 들어가는데 Gap 때문에 넘치는 경우 -> Gap을 줄임
+  // Width는 유지하고, Gap만 축소
+  else if (sum_width <= total_space && sum_width + sum_gap > total_space) {
+    fprintf(stderr, "[TTLoad] Level %d: Total Widths (%" PRIu64 ") fit in available space (%" PRIu64 "), but Gaps exceed. Compressing Gaps.\n",
+            lvs.level, sum_width, total_space);
+    uint64_t available_for_gap = total_space - sum_width;
+    double gap_scale = (double)available_for_gap / (double)(sum_gap + 1); // +1 safety
 
-    if (i == sst_count - 1) {
-      range_end = level_row.level_max;
-      //printf("[MakeSSTsFromLevel] L%d: LAST FILE i=%d/%d range_start=%" PRIu64 " range_end=%" PRIu64 " level_max=%" PRIu64 "\n",
-      //        level_row.level, i, sst_count, range_start, range_end, level_row.level_max);
-    } else {
-      uint64_t w = widths[i];
-      range_end = range_start + (w >= 1 ? w - 1 : 0);
-      if (range_end > level_row.level_max) {
-        range_end = level_row.level_max;
-      }
-      if (range_end < range_start) {
-        range_end = range_start;
-      }
-    }
+    for (double& g : gap_samples) g *= gap_scale;
+  }
 
-    if (range_start > level_row.level_max) {
-      //fprintf(stderr, "[MakeSSTsFromLevel] L%d: ERROR at i=%d/%d: range_start=%" PRIu64 " > level_max=%" PRIu64 " - SKIPPING FILE (files created so far: %zu)\n",
-      //        level_row.level, i, sst_count, range_start, level_row.level_max, sst_files.size());
-      if (i < sst_count - 1) {
-        uint64_t gap = (i < static_cast<int>(gap_samples.size())) 
-                        ? static_cast<uint64_t>(std::llround(gap_samples[i])) 
-                        : 0;
-        uint64_t next_key = range_end + 1 + gap;
-        current_key = (next_key > level_row.level_max) ? level_row.level_max + 1 : next_key;
-      }
-      continue;
-    }
-    
-    if (range_end > level_row.level_max) {
-      range_end = level_row.level_max;
+  // Case 3: Gap을 다 없애도 Width 합계가 너무 큰 경우 -> Width를 줄임
+  // Gap은 전부 0으로 만들고, Width를 줄임
+  else if (sum_width > total_space) {
+    fprintf(stderr, "[TTLoad] Level %d: Even after removing Gaps, Total Widths (%" PRIu64 ") exceed available space (%" PRIu64 "). Compressing Widths.\n",
+            lvs.level, sum_width, total_space);
+    std::fill(gap_samples.begin(), gap_samples.end(), 0.0);
+
+    // Width를 줄여야 하는데, Key 개수(sum_keys) 밑으로는 못 줄임
+    // 즉, "줄일 수 있는 여분(Compressible)" 내에서 비율대로 압축
+    uint64_t compressible = sum_width - sum_keys;
+    uint64_t target_excess = total_space - sum_keys; // 우리가 가질 수 있는 여분
+
+    // 압축 비율 계산
+    double compression_ratio = 0.0;
+    if (compressible > 0) {
+      compression_ratio = (double)target_excess / (double)compressible;
     }
 
-    SST sst;
-    sst.file_num = level_row.start_file_num + static_cast<int>(sst_files.size());
-    sst.level = level_row.level;
-    sst.min_k = range_start;
-    sst.max_k = range_end;
-    sst.num_keys = num_keys;
-    sst.out_path = MakeTableFileName(output_dir, static_cast<uint64_t>(sst.file_num));
-    sst_files.push_back(sst);
-
-    if (i < sst_count - 1) {
-      uint64_t gap = (i < static_cast<int>(gap_samples.size())) 
-                      ? static_cast<uint64_t>(std::llround(gap_samples[i])) 
-                      : 0;
-      uint64_t next_key = range_end + 1 + gap;
-      
-      if (next_key > level_row.level_max) {
-        //fprintf(stderr, "[MakeSSTsFromLevel] L%d: WARNING at i=%d: next_key=%" PRIu64 " > level_max=%" PRIu64 ", setting to level_max+1\n",
-        //        level_row.level, i, next_key, level_row.level_max);
-        current_key = level_row.level_max + 1;
-      } else {
-        current_key = next_key;
-      }
+    for (int i = 0; i < n; ++i) {
+      // (원래 Width - 최소 Width) * 비율 + 최소 Width
+      uint64_t extra = final_widths[i] - final_keys[i];
+      final_widths[i] = final_keys[i] + static_cast<uint64_t>(extra * compression_ratio);
     }
   }
-  
-  //printf("[MakeSSTsFromLevel] L%d: target_sst_count=%d actual_sst_count=%zu (entry_samples based)\n",
-  //        level_row.level, level_row.sst_count, sst_files.size());
+  // =============================================================
 
-  return sst_files;
+
+  // =============================================================
+  // step 3: finalize SST 배치 생성
+  std::vector<SST> ssts;
+  uint64_t cur_k = lvs.level_min;
+  
+  for (int i = 0; i < n; ++i) {
+    SST s;
+    s.file_num = lvs.start_file_num + i;
+    s.level = lvs.level;
+    
+    s.min_k = std::min(cur_k, lvs.level_max);
+
+    uint64_t w = final_widths[i]; // 압축된 값
+    s.max_k = s.min_k + w - 1;
+    if (s.max_k > lvs.level_max) s.max_k = lvs.level_max;
+
+    s.num_keys = final_keys[i];
+    s.out_path = MakeTableFileName(base_path, static_cast<uint64_t>(s.file_num));
+    ssts.push_back(s);
+
+    if (i < n - 1) {
+      cur_k = s.max_k + 1 + static_cast<uint64_t>(std::round(gap_samples[i]));
+    }
+  }
+  // =============================================================
+
+  return ssts;
 }
 
 class Benchmark {
@@ -5726,92 +5418,218 @@ class Benchmark {
   void S3WriteSST(ThreadState* thread) { S3DoWriteSST(thread, RANDOM); }
 
   Status S3WriteKeysToSSTFile(const SST* sst, SstFileWriter& sst_file_writer, 
-                           RandomGenerator& gen_local) {
+                            RandomGenerator& gen_local) {
+    uint64_t keys_per_sst = sst->num_keys;
+    
+    // [Fix] Range 계산 Overflow 방지 (128bit)
+    unsigned __int128 range_128 = (unsigned __int128)sst->max_k - sst->min_k + 1;
+
+    if (keys_per_sst == 0) return Status::InvalidArgument("keys_per_sst is 0");
+    if (range_128 < keys_per_sst) return Status::InvalidArgument("key_range < keys_per_sst");
+    
+    Random64 rand_gen(*seed_base + sst->file_num);
+    
+    // [State]
+    uint64_t prev_key_num = 0; 
+    bool first_key_written = false;
+    uint64_t keys_written = 0;
+
+    // [Buffer]
+    std::unique_ptr<char[]> key_buffer(new char[key_size_]); 
+    Slice key_slice(key_buffer.get(), key_size_); 
+
+    for (uint64_t i = 0; i < keys_per_sst; ++i) {
+        uint64_t keys_remaining = keys_per_sst - i;
+
+        // ---------------------------------------------------------------------
+        // 1. 이론적 분포 구간 계산 (Theoretical Range)
+        // ---------------------------------------------------------------------
+        unsigned __int128 range_mult_i = range_128 * i;
+        uint64_t offset_min = (uint64_t)(range_mult_i / keys_per_sst);
+        
+        unsigned __int128 range_mult_next = range_128 * (i + 1);
+        uint64_t offset_max = (uint64_t)(range_mult_next / keys_per_sst);
+
+        uint64_t theoretical_min = sst->min_k + offset_min;
+        
+        // theoretical_max 계산 (Overflow 방지)
+        uint64_t theoretical_max;
+        if (offset_max == 0) theoretical_max = sst->min_k;
+        else {
+             unsigned __int128 t_max_128 = (unsigned __int128)sst->min_k + offset_max - 1;
+             theoretical_max = (t_max_128 > sst->max_k) ? sst->max_k : (uint64_t)t_max_128;
+        }
+
+        // ---------------------------------------------------------------------
+        // 2. 물리적 제약 조건 계산 (Constraints)
+        // ---------------------------------------------------------------------
+        
+        // [Constraint A] Strict Ascending (절대 위반 불가)
+        // 이전 키 + 1. (첫 키라면 min_k)
+        uint64_t min_possible = first_key_written ? (prev_key_num + 1) : sst->min_k;
+        
+        // [Constraint B] Hard Limit (공간 예약)
+        // 남은 키들이 들어갈 자리는 남겨둬야 함. 
+        // 범위를 벗어나면 안 되므로 언더플로우 방지 로직 포함
+        uint64_t space_needed_for_rest = keys_remaining - 1;
+        uint64_t absolute_hard_limit = sst->max_k;
+        if (sst->max_k >= space_needed_for_rest) {
+            absolute_hard_limit = sst->max_k - space_needed_for_rest;
+        } else {
+            // 물리적으로 불가능한 상황 (이미 앞에서 걸러졌어야 함)
+            absolute_hard_limit = min_possible; 
+        }
+
+        // ---------------------------------------------------------------------
+        // 3. 최종 구간 확정 (Resolution)
+        // ---------------------------------------------------------------------
+        
+        // (1) Bucket Min: 이론적 위치와 최소 가능 위치 중 큰 값
+        uint64_t bucket_min = std::max(theoretical_min, min_possible);
+        
+        // (2) Bucket Max: 이론적 최대와 하드 리미트 중 작은 값
+        uint64_t bucket_max = std::min(theoretical_max, absolute_hard_limit);
+
+        // [CRITICAL FIX] 
+        // 만약 하드 리미트 때문에 Max가 Min보다 작아졌다면?
+        // -> "오름차순(Min)"이 "공간 확보(Max)"보다 우선이다.
+        // -> Max를 Min으로 끌어올린다. (이렇게 하면 나중에 공간이 부족할 수 있지만, 당장 죽지는 않음)
+        if (bucket_max < bucket_min) {
+            bucket_max = bucket_min;
+        }
+        
+        // (만약 bucket_min > absolute_hard_limit 이라면, 
+        //  이미 물리적 공간이 부족한 상태지만 Ascending을 위해 강행)
+
+        // ---------------------------------------------------------------------
+        // 4. 랜덤 선택 및 쓰기
+        // ---------------------------------------------------------------------
+        uint64_t key_num = bucket_min;
+        uint64_t bucket_size = bucket_max - bucket_min + 1;
+
+        if (bucket_size > 1) {
+            key_num += rand_gen.Next() % bucket_size;
+        }
+
+        // 키 생성
+        GenerateKeyFromInt(key_num, FLAGS_num, &key_slice);
+        Slice val = gen_local.Generate();
+        
+        Status s = sst_file_writer.Put(key_slice, val);
+        if (!s.ok()) {
+            fprintf(stderr, "[Error] Put failed: %s, i=%" PRIu64 ", Key=%" PRIu64 " (Prev=%" PRIu64 ")\n", 
+                    s.ToString().c_str(), i, key_num, prev_key_num);
+            return s;
+        }
+        
+        prev_key_num = key_num;
+        first_key_written = true;
+        keys_written++;
+    }
+
+    return Status::OK();
+  }
+  
+  /*
+  Status S3WriteKeysToSSTFile(const SST* sst, SstFileWriter& sst_file_writer, 
+                            RandomGenerator& gen_local) {
     uint64_t keys_per_sst = sst->num_keys;
     uint64_t key_range = sst->max_k - sst->min_k + 1;
+
     if (keys_per_sst == 0) {
       return Status::InvalidArgument("Invalid SST metadata: keys_per_sst is 0");
     }
     
+    // [Safety] 키 개수가 물리적 범위를 초과하는 경우 방어
     if (key_range < keys_per_sst) {
       fprintf(stderr, "[S3WriteKeysToSSTFile] ERROR: file_num=%d key_range=%" PRIu64 " < keys_per_sst=%" PRIu64 "\n",
               sst->file_num, key_range, keys_per_sst);
       return Status::InvalidArgument("key_range < keys_per_sst");
     }
     
-    Random64 rand_gen(*seed_base);
-    long double bucket_width = static_cast<long double>(key_range) / static_cast<long double>(keys_per_sst);
-    
-    uint64_t prev_key_num = sst->min_k - 1;
-    uint64_t keys_written = 0;
-    
-    for (uint64_t i = 0; i < keys_per_sst; ++i) {
-        if (prev_key_num >= sst->max_k) {
-          break;
-        }
-        
-        long double theoretical_bucket_start = bucket_width * static_cast<long double>(i);
-        long double theoretical_bucket_end = bucket_width * static_cast<long double>(i + 1);
-        
-        uint64_t theoretical_min = sst->min_k + static_cast<uint64_t>(theoretical_bucket_start);
-        uint64_t theoretical_max = sst->min_k + static_cast<uint64_t>(theoretical_bucket_end);
-        
-        if (theoretical_max > sst->max_k) {
-          theoretical_max = sst->max_k;
-        }
-        
-        uint64_t bucket_min = std::max(prev_key_num + 1, theoretical_min);  
-        uint64_t bucket_max = std::min(theoretical_max, sst->max_k);
-        
-        if (bucket_min > bucket_max) {
-          break;
-        }
-        
-        uint64_t bucket_range = bucket_max - bucket_min + 1;
-        uint64_t key_num;
-        
-        if (bucket_range <= 1) {
-          key_num = bucket_min;
-        } else {
-          long double random_ratio =
-              static_cast<long double>(rand_gen.Next()) /
-              static_cast<long double>(std::numeric_limits<uint64_t>::max());
-          uint64_t offset = static_cast<uint64_t>(
-              random_ratio * static_cast<long double>(bucket_range - 1));
-          key_num = bucket_min + offset;
-        }
-        
-        if (key_num <= prev_key_num) {
-          key_num = prev_key_num + 1;
-        }
-        if (key_num > sst->max_k) {
-          key_num = sst->max_k;
-        }
-        
-        if (key_num == prev_key_num) {
-          break;
-        }
-        
-        prev_key_num = key_num;
-        
-        std::unique_ptr<const char[]> key_guard;
-        Slice key = AllocateKey(&key_guard);
-        GenerateKeyFromInt(key_num, FLAGS_num, &key);
-        Slice val = gen_local.Generate();
-    
-        Status s = sst_file_writer.Put(key, val);
-        
-        if (!s.ok()) {
-          fprintf(stderr, "[S3WriteKeysToSSTFile] ERROR: file_num=%d failed at i=%" PRIu64 "/%" PRIu64 " (keys_written=%" PRIu64 ", key_num=%" PRIu64 "): %s\n",
-                  sst->file_num, i, keys_per_sst, keys_written, key_num, s.ToString().c_str());
-          return s;
-        }
-        
-        keys_written++;
-    }
-    
-    return Status::OK();
+      // [Fix 1] 파일 번호를 시드에 섞어서 파일마다 다른 분포 패턴 생성
+      Random64 rand_gen(*seed_base + sst->file_num);
+
+      // [Fix 2] prev_key_num 언더플로우 방지
+      // 0에서 1을 빼면 UINT64_MAX가 되므로, 별도의 초기화 값을 쓰거나 flag를 사용해야 합니다.
+      // 여기서는 루프 내에서 처리하도록 초기값을 min_k로 잡고 별도 처리합니다.
+      uint64_t prev_key_num = sst->min_k; 
+      bool first_key_written = false;
+
+      uint64_t keys_written = 0;
+
+      for (uint64_t i = 0; i < keys_per_sst; ++i) {
+          // 남은 키 개수
+          uint64_t keys_remaining = keys_per_sst - i;
+          
+          // [Fix 3] 부동소수점(long double) 제거 -> 정수 연산으로 구간 정밀 계산
+          // "전체 범위 중 i번째 키가 대략 어디쯤 있어야 하는가?"
+          // 수식: offset = (range * i) / count
+          unsigned __int128 range_mult_i = (unsigned __int128)(key_range) * i;
+          uint64_t offset_min = (uint64_t)(range_mult_i / keys_per_sst);
+          
+          unsigned __int128 range_mult_next = (unsigned __int128)(key_range) * (i + 1);
+          uint64_t offset_max = (uint64_t)(range_mult_next / keys_per_sst);
+          
+          // 이론적 배치 구간
+          uint64_t theoretical_min = sst->min_k + offset_min;
+          uint64_t theoretical_max = sst->min_k + offset_max;
+          if (theoretical_max > sst->max_k) theoretical_max = sst->max_k;
+
+          // [Fix 4] 단조 증가(Monotonic Increase) 보장 및 Hard Limit 설정
+          // 이전 키 바로 다음 값(prev + 1)이 최소한의 시작점
+          uint64_t min_possible = first_key_written ? (prev_key_num + 1) : sst->min_k;
+
+          // 뒤에 남은 키들을 위해 반드시 남겨둬야 하는 공간 계산 (Greedy 방지)
+          // 예: Range 끝이 100이고 남은 키가 5개면, 현재 키는 95를 넘으면 안 됨.
+          uint64_t absolute_hard_limit = sst->max_k - (keys_remaining - 1);
+          
+          // 실제 버킷 범위 결정
+          uint64_t bucket_min = std::max(min_possible, theoretical_min);
+          uint64_t bucket_max = std::min(theoretical_max, absolute_hard_limit);
+
+          // 보정: 이론적 범위가 틀어졌을 때 안전장치
+          if (bucket_min > absolute_hard_limit) bucket_min = absolute_hard_limit;
+          if (bucket_max < bucket_min) bucket_max = bucket_min;
+
+          // 버킷 내에서 랜덤 선택
+          uint64_t key_num = bucket_min;
+          uint64_t bucket_size = bucket_max - bucket_min + 1;
+
+          if (bucket_size > 1) {
+              // 1개 이상의 공간이 있으면 랜덤 오프셋 적용
+              uint64_t offset = rand_gen.Next() % bucket_size;
+              key_num += offset;
+          }
+
+          // 최종 키 생성 및 쓰기
+          std::unique_ptr<const char[]> key_guard;
+          Slice key = AllocateKey(&key_guard);
+          GenerateKeyFromInt(key_num, FLAGS_num, &key);
+          Slice val = gen_local.Generate();
+      
+          Status s = sst_file_writer.Put(key, val);
+          
+          if (!s.ok()) {
+            fprintf(stderr, "[S3WriteKeysToSSTFile] ERROR: file_num=%d failed at i=%" PRIu64 "/%" PRIu64 ": %s\n",
+                    sst->file_num, i, keys_per_sst, s.ToString().c_str());
+            return s;
+          }
+          
+          prev_key_num = key_num;
+          first_key_written = true;
+          keys_written++;
+      }
+      
+      // [Safety Check] 의도한 개수만큼 다 썼는지 확인
+      if (keys_written != keys_per_sst) {
+          fprintf(stderr, "[S3WriteKeysToSSTFile] WARNING: Expected %" PRIu64 " keys but wrote %" PRIu64 " (Range: [%" PRIu64 ", %" PRIu64 "])\n",
+                  keys_per_sst, keys_written, sst->min_k, sst->max_k);
+      }
+
+      return Status::OK();
   }
+  */
 
   void S3DoWriteSST([[maybe_unused]]ThreadState* thread, [[maybe_unused]]WriteMode write_mode) {
     // The ttload workload uses internal parallelism (tt_threads) to handle
@@ -5823,11 +5641,18 @@ class Benchmark {
       return;
     }
 
+    if (FLAGS_csv_path.empty()) {
+      fprintf(stderr, "[S3DoWriteSST] ERROR: --csv_path must be specified\n");
+      return;
+    }
+
     Options options = open_options_;
 
     // Can be optimized - godong
     IngestExternalFileOptions ifo;
     ifo.move_files = false;
+    // need to check ingestion options
+    // ifo.write_global_seqno = false; // 필요에 따라 true/false 설정 (LSM 구축 시 보통 false가 빠름)
 
     int64_t stage = 0;
     size_t id = 0;
@@ -5838,294 +5663,203 @@ class Benchmark {
     }
     DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(id);
     
-    // === Read level stats from CSV ===
-    if (FLAGS_csv_path.empty()) {
-      fprintf(stderr, "[S3DoWriteSST] ERROR: --csv_path must be specified\n");
-      return;
-    }
-    
-    // === Prepare level stats ===
-    // This loads the predicted LSM-tree structure (level, number of keys, etc.) from the CSV.
+    //========================= Phase 1 =========================//
+    // Phase1. Read level stats from CSV
     const std::string csv_path = FLAGS_csv_path;
     std::vector<LevelStats> levels = LevelStatsFromCsv(csv_path);
-    
-    // === Set output directory ===
+
     std::string output_dir = FLAGS_db;
     while (!output_dir.empty() && output_dir.back() == '/') {
       output_dir.pop_back();
     }
+    //===========================================================//
 
-    // === Prepare for multi-threaded level ingestion ===
-    // We use a custom ThreadPool to perform parallel SST generation and ingestion.
-    ThreadPool* thread_pool = GetS3ThreadPool();
-    
-    std::atomic<int> pending_level_jobs(0);
-    std::mutex level_completion_mutex;
-    std::condition_variable level_completion_cv;
-    
-    // Synchronization primitives to manage dependencies between levels.
-    // In LSM-tree ingestion, we usually populate from bottom to top (L6 down to L0)
-    // to ensure that data in lower levels doesn't trigger unexpected compactions 
-    // or visibility issues during the batch load.
-    std::vector<std::condition_variable> level_cvs(levels.size());
-    std::vector<std::mutex> level_mutexes(levels.size());
-    std::vector<std::atomic<bool>> level_ingest_started(levels.size());
-    
+    //========================= Phase 2 =========================//
+    // Phase2. Prepare SST file metadata for all levels
+    // SSTs per level
+    std::vector<std::vector<SST>> all_levels_ssts(levels.size());
+    // Flattened list of all SST tasks across levels for tracking.
+    std::vector<SST*> flat_task_list; 
+
     for (size_t i = 0; i < levels.size(); ++i) {
-      level_ingest_started[i].store(false);
+      all_levels_ssts[i] = MakeSSTsFromLevel(levels[i], output_dir);
+      
+      for (auto& sst : all_levels_ssts[i]) {
+        flat_task_list.push_back(&sst);
+      }
     }
     
-    // Submit jobs for each level in reverse order (L_max to L0).
-    for (size_t level_idx = levels.size(); level_idx-- > 0; ) {
-      const auto& lvl = levels[level_idx];
-      // new level started
-      pending_level_jobs++;
-      
-      thread_pool->SubmitJob([&, level_idx, lvl]() {
-        // [Level Dependency Synchronization]
-        // Upper levels (e.g., L5) must wait until lower levels (e.g., L6) have at least
-        // finished their setup and started ingestion to maintain tree integrity.
+    fprintf(stdout, "[S3DoWriteSST] Total SST files to create: %zu across %zu levels.\n", 
+          flat_task_list.size(), levels.size());
+    //===========================================================//
 
-        // implemented using level condition variables and mutexes
-        // if L4, wait for L5 to start L5.wait() { return L5.load }
-        if (level_idx + 1 < levels.size()) {
-          std::unique_lock<std::mutex> prev_lock(level_mutexes[level_idx + 1]);
-          level_cvs[level_idx + 1].wait(prev_lock, [&] {
-            return level_ingest_started[level_idx + 1].load();
-          });
-        }
-
-        // Calculate the number of threads allocated for this level.
-        int base_threads = FLAGS_tt_threads > 0 ? FLAGS_tt_threads : 1;
-
-        // used for target level ingestion
-        IngestExternalFileOptions ifo_local = ifo;
-        ifo_local.s3_ingest = true;
-        ifo_local.s3_target_level = lvl.level;
-
-        // Generate metadata (key ranges, paths) for SST files belonging to this level.
-        std::vector<SST> ssts = MakeSSTsFromLevel(lvl, output_dir, 
-                                                   FLAGS_target_file_size_base, FLAGS_key_size, FLAGS_value_size, 
-                                                   static_cast<int>(levels.size()), nullptr);
-      
-        // Queue up SST tasks for the worker threads to process in parallel.
-        std::queue<const SST*> sst_queue;
-        std::mutex queue_mutex;
-        std::mutex ingest_queue_mutex;
-        std::atomic<int> completed_count(0);
-        std::atomic<int> success_count(0);
-        std::atomic<int> fail_count(0);
-        std::vector<std::string> ingest_queue;  
+    //========================= Phase 3 =========================//
+    // Phase 3. Parallel SST generation using thread pool
+    ThreadPool* thread_pool = GetS3ThreadPool();
+    
+    std::atomic<size_t> pending_jobs(flat_task_list.size());
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
+    
+    std::atomic<int> success_count(0);
+    std::atomic<int> fail_count(0);
+    
+    // Submit SST generation jobs to the thread pool.
+    for (SST* sst_ptr : flat_task_list) {
+      thread_pool->SubmitJob([&, sst_ptr]() {
+        // Local copies for thread safety.
+        RandomGenerator gen_local;
+        Options options_local = options;
         
-        for (const auto& sst : ssts) {
-          sst_queue.push(&sst);
-        }
-        
-        // [Parallel SST Generation]
-        // We use multiple threads within the level to generate SST files concurrently.
-        // Higher levels (with more files) or L0 can scale their thread count accordingly.
-        int num_sst_threads = base_threads * (lvl.level == 0 ? 1 : lvl.level);
-        std::atomic<int> pending_sst_jobs(num_sst_threads);
-        std::condition_variable sst_done_cv;
-        std::mutex sst_done_mutex;
-        
-        for (int t = 0; t < num_sst_threads; ++t) {
-          thread_pool->SubmitJob([&, t]() {
-            RandomGenerator gen_local;
-            Options options_local = options;
-            
-            while (true) {
-              const SST* sst = nullptr;
-              {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                if (sst_queue.empty()) {
-                  break;
-                }
-                sst = sst_queue.front();
-                sst_queue.pop();
-              } 
-              
-              std::string sst_path = sst->out_path;
-              Status s = Status::OK();
-              
-              {
-                EnvOptions env_opts;
-                // Use direct I/O for SST writing to bypass page cache and stress storage.
-                env_opts.use_direct_writes = true;
-                env_opts.use_direct_reads = true;
-                SstFileWriter sst_file_writer(env_opts, options_local);
-                
-                // Open and write keys to the SST file based on the metadata in 'sst'.
-                s = sst_file_writer.Open(sst_path);
-                if (!s.ok()) {
-                  fprintf(stderr, "[Level %d SST Thread %d] Failed to open SST file %s: %s (file_num=%d)\n", 
-                          lvl.level, t, sst_path.c_str(), s.ToString().c_str(), sst->file_num);
-                  fail_count++;
-                  completed_count++;
-                  continue;
-                }
+        std::string sst_path = sst_ptr->out_path;
+        Status s = Status::OK();
 
-                // Internal function to populate the writer with keys in the specified range.
-                s = S3WriteKeysToSSTFile(sst, sst_file_writer, gen_local);
-                if (!s.ok()) {
-                  fprintf(stderr, "[Level %d SST Thread %d] Failed to write keys to SST file %s: %s (file_num=%d, min_k=%" PRIu64 ", max_k=%" PRIu64 ", num_keys=%" PRIu64 ")\n",
-                          lvl.level, t, sst_path.c_str(), s.ToString().c_str(), sst->file_num, sst->min_k, sst->max_k, sst->num_keys);
-                  fail_count++;
-                  completed_count++;
-                  continue;
-                }
-                
-                s = sst_file_writer.Finish();
-                if (!s.ok()) {
-                  fail_count++;
-                  completed_count++;
-                  continue;
-                }
-                
-                // Verify that the file was actually written to disk.
-                uint64_t file_size = 0;
-                Status size_status = Env::Default()->GetFileSize(sst_path, &file_size);
-                if (!size_status.ok() || file_size == 0) {
-                  s = Status::IOError("SST file not ready after Finish()");
-                  fail_count++;
-                }
-              }
-              
-              if (s.ok()) {
-                std::lock_guard<std::mutex> ingest_lock(ingest_queue_mutex);
-                ingest_queue.push_back(sst_path);
-                success_count++;
-              } else {
-                fail_count++;
-              }
-              
-              completed_count++;
-            }
-            
-            // Notify the level coordinator when this worker thread finishes its tasks.
-            {
-              std::lock_guard<std::mutex> lock(sst_done_mutex);
-              if (--pending_sst_jobs == 0) {
-                sst_done_cv.notify_one();
-              }
-            }
-          });
-        }
-        
-        // Wait for all SST files in this level to be generated.
+        // SST file creation
         {
-          std::unique_lock<std::mutex> lock(sst_done_mutex);
-          sst_done_cv.wait(lock, [&] { return pending_sst_jobs.load() == 0; });
-        }
-        
-        // Signal the next level (upper level) that it can start its processing.
-        if (level_idx > 0) {
-          std::lock_guard<std::mutex> lock(level_mutexes[level_idx]);
-          level_ingest_started[level_idx].store(true);
-          level_cvs[level_idx].notify_all();
-        }
-        
-        // [Batch Ingestion Phase]
-        // Once the SST files are ready, we ingest them into the live RocksDB instance.
-        // Files are processed in parallel batches.
-        if (!ingest_queue.empty()) {
-          int num_ingest_threads = base_threads * (lvl.level == 0 ? 1 : lvl.level);
-          // batch size 
-          const size_t batch_size = ingest_queue.size() / num_ingest_threads + 1;
+          EnvOptions env_opts;
+          // Use direct I/O for SST writing to bypass page cache and stress storage.
+          env_opts.use_direct_writes = true;
+          env_opts.use_direct_reads = true;
           
-          std::queue<std::vector<std::string>> ingest_batch_queue;
-          std::mutex ingest_batch_queue_mutex;
-          std::condition_variable ingest_batch_queue_cv;
-          bool ingest_done = false;
-          std::atomic<int> ingested_count(0);
+          SstFileWriter sst_file_writer(env_opts, options_local);
           
-          // Partition the generated files into batches for ingestion.
-          std::vector<std::string> current_batch;
-          for (size_t i = 0; i < ingest_queue.size(); ++i) {
-            current_batch.push_back(ingest_queue[i]);
-            if (current_batch.size() >= batch_size || i == ingest_queue.size() - 1) {
-              ingest_batch_queue.push(current_batch);
-              current_batch.clear();
+          // Open file
+          s = sst_file_writer.Open(sst_path);
+          if (!s.ok()) {
+             fprintf(stderr, "[DEBUG_FAIL] Open failed for %s: %s\n", 
+                     sst_path.c_str(), s.ToString().c_str());
+          }
+
+          if (s.ok()) {
+            // Key generation and writing (heaviest task)
+            s = S3WriteKeysToSSTFile(sst_ptr, sst_file_writer, gen_local);
+            
+            if (!s.ok()) {
+               fprintf(stderr, "[DEBUG_FAIL] WriteKeys failed for %s: %s\n"
+                               "  -> Meta: Keys=%" PRIu64 ", Range=[%" PRIu64 ", %" PRIu64 "]\n",
+                       sst_path.c_str(), s.ToString().c_str(), 
+                       sst_ptr->num_keys, sst_ptr->min_k, sst_ptr->max_k);
             }
           }
           
-          std::atomic<int> pending_ingest_jobs(num_ingest_threads);
-          std::condition_variable ingest_done_cv;
-          std::mutex ingest_done_mutex;
-          
-          for (int t = 0; t < num_ingest_threads; ++t) {
-            thread_pool->SubmitJob([&, t]() {
-              while (true) {
-                std::vector<std::string> batch;
-                {
-                  std::unique_lock<std::mutex> lock(ingest_batch_queue_mutex);
-                  ingest_batch_queue_cv.wait(lock, [&] { return ingest_done || !ingest_batch_queue.empty(); });
-                  
-                  if (ingest_done && ingest_batch_queue.empty()) {
-                    break;
-                  }
-                  
-                  if (!ingest_batch_queue.empty()) {
-                    batch = ingest_batch_queue.front();
-                    ingest_batch_queue.pop();
-                  }
-                }
-                
-                if (batch.empty()) {
-                  continue;
-                }
-                
-                // Call IngestExternalFile with the target level specified.
-                // This manually placed ingestion builds the LSM tree structure directly.
-                Status s = db_with_cfh->db->IngestExternalFile(batch, ifo_local);
-                if (!s.ok()) {
-                  fprintf(stderr, "[Level %d Ingest Thread %d] Failed to ingest batch of %zu files: %s\n", 
-                          lvl.level, t, batch.size(), s.ToString().c_str());
-                } else {
-                  ingested_count.fetch_add(static_cast<int>(batch.size()));
-                }
-              }
-              
-              {
-                std::lock_guard<std::mutex> lock(ingest_done_mutex);
-                if (--pending_ingest_jobs == 0) {
-                  ingest_done_cv.notify_one();
-                }
-              }
-            });
-          }
-          
-          {
-            std::unique_lock<std::mutex> lock(ingest_batch_queue_mutex);
-            ingest_done = true;
-          }
-          ingest_batch_queue_cv.notify_all();
-          
-          {
-            std::unique_lock<std::mutex> lock(ingest_done_mutex);
-            ingest_done_cv.wait(lock, [&] { return pending_ingest_jobs.load() == 0; });
+          if (s.ok()) {
+            // Metadata finalization and closing
+            s = sst_file_writer.Finish();
+            
+            if (!s.ok()) {
+               fprintf(stderr, "[DEBUG_FAIL] Finish failed for %s: %s (Did S3WriteKeysToSSTFile write 0 keys?)\n", 
+                       sst_path.c_str(), s.ToString().c_str());
+              fprintf(stderr, "  -> Meta: Keys=%" PRIu64 ", Range=[%" PRIu64 ", %" PRIu64 "]\n",
+                      sst_ptr->num_keys, sst_ptr->min_k, sst_ptr->max_k);
+            }
           }
         }
-        
-        // Finalize level job and notify the main benchmark thread.
-        {
-          std::lock_guard<std::mutex> lock(level_completion_mutex);
-          if (--pending_level_jobs == 0) {
-            level_completion_cv.notify_one();
-          }
+
+        if (s.ok()) {
+          success_count++;
+        } else {
+          fail_count++;
+          fprintf(stderr, "[S3DoWriteSST] Failed to write SST %s: %s\n", 
+                  sst_path.c_str(), s.ToString().c_str());
+        }
+
+        // Check and notify job completion
+        if (--pending_jobs == 0) {
+          std::lock_guard<std::mutex> lock(done_mutex);
+          done_cv.notify_one();
         }
       });
     }
-    
-    // Wait for all levels (L6 to L0) to complete their generation and ingestion.
-    {
-      std::unique_lock<std::mutex> lock(level_completion_mutex);
-      level_completion_cv.wait(lock, [&] { return pending_level_jobs.load() == 0; });
+    //==============================================================//
+
+    //========================= Sync Point =========================//
+    // Sync point: wait for all SST generation jobs to complete.
+    // This ensures that when we start level ingestion, all SST files are ready.
+    if (!flat_task_list.empty()) {
+      std::unique_lock<std::mutex> lock(done_mutex);
+      done_cv.wait(lock, [&] { return pending_jobs.load() == 0; });
     }
     
-    // Cleanup the thread pool.
+    fprintf(stdout, "[S3DoWriteSST] SST Generation Completed. Success: %d, Failed: %d\n", 
+          success_count.load(), fail_count.load());
+
+    if (fail_count > 0) {
+      fprintf(stderr, "[S3DoWriteSST] Aborting ingestion due to file generation errors.\n");
+      thread_pool->WaitForJobsAndJoinAllThreads();
+      return;
+    } 
+    //==============================================================//
+
+    //========================= Phase 4 =========================//
+    // Phase 4. Level-wise ingestion with dependency management
+    const size_t kBatchSize = 16;
+
+    for (int i = static_cast<int>(levels.size()) - 1; i >= 0; --i) {
+      const auto& lvl_stats = levels[i];
+      const auto& ssts = all_levels_ssts[i];
+      
+      if (ssts.empty()) continue;
+
+      size_t total_files = ssts.size();
+      size_t num_batches = (total_files + kBatchSize - 1) / kBatchSize;
+
+      fprintf(stdout, "[S3DoWriteSST] Ingesting Level %d: %zu files in %zu batches (BatchSize=%zu)...\n", 
+              lvl_stats.level, total_files, num_batches, kBatchSize);
+
+      IngestExternalFileOptions ifo_local = ifo;
+      ifo_local.s3_ingest = true;
+      ifo_local.s3_target_level = lvl_stats.level;
+      
+      std::atomic<int> ingest_pending_jobs(static_cast<int>(num_batches));
+      std::mutex ingest_mutex;
+      std::condition_variable ingest_cv;
+      std::atomic<int> ingest_fail_count(0);
+
+      for (size_t b = 0; b < num_batches; ++b) {
+        size_t start_idx = b * kBatchSize;
+        size_t end_idx = std::min(start_idx + kBatchSize, total_files);
+        
+        std::vector<std::string> batch_paths;
+        batch_paths.reserve(end_idx - start_idx);
+        
+        for (size_t k = start_idx; k < end_idx; ++k) {
+          batch_paths.push_back(ssts[k].out_path);
+        }
+
+        // 람다 캡처에서도 변경된 변수명 사용
+        thread_pool->SubmitJob([&, batch_paths, ifo_local]() {
+          Status s = db_with_cfh->db->IngestExternalFile(batch_paths, ifo_local);
+          
+          if (!s.ok()) {
+            fprintf(stderr, "[S3DoWriteSST] ERROR: Ingest failed for Level %d (Batch %zu): %s\n", 
+                    lvl_stats.level, b, s.ToString().c_str());
+            ingest_fail_count++; // [수정]
+          }
+
+          if (--ingest_pending_jobs == 0) { // [수정]
+            std::lock_guard<std::mutex> lock(ingest_mutex); // [수정]
+            ingest_cv.notify_one(); // [수정]
+          }
+        });
+      }
+
+      // 대기 로직 수정
+      {
+        std::unique_lock<std::mutex> lock(ingest_mutex); // [수정]
+        ingest_cv.wait(lock, [&] { return ingest_pending_jobs.load() == 0; }); // [수정]
+      }
+
+      if (ingest_fail_count > 0) { // [수정]
+        fprintf(stderr, "[S3DoWriteSST] WARNING: Level %d had %d batch failures.\n", 
+                lvl_stats.level, ingest_fail_count.load());
+      }
+    }
+    //==============================================================//
+
+    // Final sync to ensure all ingestion jobs are done.
     thread_pool->WaitForJobsAndJoinAllThreads();
-  }
+    fprintf(stdout, "[S3DoWriteSST] All workloads completed.\n");
+}
 
   void WriteUniqueRandom(ThreadState* thread) {
     DoWrite(thread, UNIQUE_RANDOM);
