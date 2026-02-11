@@ -304,6 +304,8 @@ static std::optional<int64_t> seed_base;
 DEFINE_int32(threads, 1, "Number of concurrent threads to run.");
 
 DEFINE_int32(tt_threads, 48, "Number of concurrent threads to use for ttload (internal pool).");
+DEFINE_int32(tt_ingest_batch, 16,
+             "Number of SST files per ingest batch for ttload ingestion.");
 
 DEFINE_int32(duration, 0,
              "Time in seconds for the random-ops tests to run."
@@ -5426,9 +5428,15 @@ class Benchmark {
 
     if (range_128 < keys_per_sst) return Status::InvalidArgument("key_range < keys_per_sst");
     
+    const uint64_t base_bucket_width =
+        static_cast<uint64_t>(range_128 / keys_per_sst);
+    const uint64_t extra_slots =
+        static_cast<uint64_t>(range_128 % keys_per_sst);
+
     Random64 rand_gen(*seed_base + sst->file_num);
-    uint64_t prev_key_num = 0; 
-    bool first_key_written = false;
+    uint64_t prev_key_num = sst->min_k;
+    bool has_prev_key = false;
+    unsigned __int128 offset_start = 0;
 
     std::unique_ptr<char[]> key_buffer(new char[key_size_]); 
     Slice key_slice(key_buffer.get(), key_size_); 
@@ -5436,15 +5444,17 @@ class Benchmark {
     for (uint64_t i = 0; i < keys_per_sst; ++i) {
       uint64_t keys_remaining = keys_per_sst - i;
 
-      // 1. Calculate theoretical interval for this key based on uniform distribution
-      uint64_t theoretical_min = sst->min_k + (uint64_t)((range_128 * i) / keys_per_sst);
-      uint64_t theoretical_max = sst->min_k + (uint64_t)((range_128 * (i + 1)) / keys_per_sst);
-
-      // Make max exclusive
-      if (theoretical_max > 0) theoretical_max--;
+      // Calculate the theoretical interval for this key using incremental
+      // offsets. This avoids two expensive 128-bit mul/div operations per key.
+      uint64_t bucket_width = base_bucket_width + (i < extra_slots ? 1 : 0);
+      unsigned __int128 offset_end = offset_start + bucket_width;
+      uint64_t theoretical_min = sst->min_k + static_cast<uint64_t>(offset_start);
+      uint64_t theoretical_max =
+          sst->min_k + static_cast<uint64_t>(offset_end - 1);
+      offset_start = offset_end;
 
       // 2. Constraints: Must be strictly ascending and leave space for remaining keys
-      uint64_t min_possible = first_key_written ? (prev_key_num + 1) : sst->min_k;
+      uint64_t min_possible = has_prev_key ? (prev_key_num + 1) : sst->min_k;
       uint64_t max_possible = sst->max_k;
       if (sst->max_k >= (keys_remaining - 1)) {
         max_possible = sst->max_k - (keys_remaining - 1);
@@ -5475,7 +5485,7 @@ class Benchmark {
       }
       
       prev_key_num = key_num;
-      first_key_written = true;
+      has_prev_key = true;
     }
 
     return Status::OK();
@@ -5490,6 +5500,12 @@ class Benchmark {
 
     if (FLAGS_csv_path.empty()) {
       fprintf(stderr, "[S3DoWriteSST] ERROR: --csv_path must be specified\n");
+      return;
+    }
+    if (FLAGS_tt_ingest_batch <= 0) {
+      fprintf(stderr,
+              "[S3DoWriteSST] ERROR: --tt_ingest_batch must be > 0 (got %d)\n",
+              FLAGS_tt_ingest_batch);
       return;
     }
 
@@ -5608,7 +5624,7 @@ class Benchmark {
 
     //========================= Phase 4 =========================//
     // Phase 4. Level-wise ingestion with dependency management
-    const size_t kBatchSize = 16;
+    const size_t kBatchSize = static_cast<size_t>(FLAGS_tt_ingest_batch);
     for (int i = static_cast<int>(levels.size()) - 1; i >= 0; --i) {
       const auto& lvl_stats = levels[i];
       const auto& ssts = all_levels_ssts[i];
