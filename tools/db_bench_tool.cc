@@ -5419,222 +5419,69 @@ class Benchmark {
 
   Status S3WriteKeysToSSTFile(const SST* sst, SstFileWriter& sst_file_writer, 
                             RandomGenerator& gen_local) {
-    uint64_t keys_per_sst = sst->num_keys;
-    
-    // [Fix] Range 계산 Overflow 방지 (128bit)
-    unsigned __int128 range_128 = (unsigned __int128)sst->max_k - sst->min_k + 1;
+    if (sst->num_keys == 0) return Status::InvalidArgument("keys_per_sst is 0");
 
-    if (keys_per_sst == 0) return Status::InvalidArgument("keys_per_sst is 0");
+    const uint64_t keys_per_sst = sst->num_keys;
+    const unsigned __int128 range_128 = (unsigned __int128)sst->max_k - sst->min_k + 1;
+
     if (range_128 < keys_per_sst) return Status::InvalidArgument("key_range < keys_per_sst");
     
     Random64 rand_gen(*seed_base + sst->file_num);
-    
-    // [State]
     uint64_t prev_key_num = 0; 
     bool first_key_written = false;
-    uint64_t keys_written = 0;
 
-    // [Buffer]
     std::unique_ptr<char[]> key_buffer(new char[key_size_]); 
     Slice key_slice(key_buffer.get(), key_size_); 
 
     for (uint64_t i = 0; i < keys_per_sst; ++i) {
-        uint64_t keys_remaining = keys_per_sst - i;
+      uint64_t keys_remaining = keys_per_sst - i;
 
-        // ---------------------------------------------------------------------
-        // 1. 이론적 분포 구간 계산 (Theoretical Range)
-        // ---------------------------------------------------------------------
-        unsigned __int128 range_mult_i = range_128 * i;
-        uint64_t offset_min = (uint64_t)(range_mult_i / keys_per_sst);
-        
-        unsigned __int128 range_mult_next = range_128 * (i + 1);
-        uint64_t offset_max = (uint64_t)(range_mult_next / keys_per_sst);
+      // 1. Calculate theoretical interval for this key based on uniform distribution
+      uint64_t theoretical_min = sst->min_k + (uint64_t)((range_128 * i) / keys_per_sst);
+      uint64_t theoretical_max = sst->min_k + (uint64_t)((range_128 * (i + 1)) / keys_per_sst);
 
-        uint64_t theoretical_min = sst->min_k + offset_min;
-        
-        // theoretical_max 계산 (Overflow 방지)
-        uint64_t theoretical_max;
-        if (offset_max == 0) theoretical_max = sst->min_k;
-        else {
-             unsigned __int128 t_max_128 = (unsigned __int128)sst->min_k + offset_max - 1;
-             theoretical_max = (t_max_128 > sst->max_k) ? sst->max_k : (uint64_t)t_max_128;
-        }
+      // Make max exclusive
+      if (theoretical_max > 0) theoretical_max--;
 
-        // ---------------------------------------------------------------------
-        // 2. 물리적 제약 조건 계산 (Constraints)
-        // ---------------------------------------------------------------------
-        
-        // [Constraint A] Strict Ascending (절대 위반 불가)
-        // 이전 키 + 1. (첫 키라면 min_k)
-        uint64_t min_possible = first_key_written ? (prev_key_num + 1) : sst->min_k;
-        
-        // [Constraint B] Hard Limit (공간 예약)
-        // 남은 키들이 들어갈 자리는 남겨둬야 함. 
-        // 범위를 벗어나면 안 되므로 언더플로우 방지 로직 포함
-        uint64_t space_needed_for_rest = keys_remaining - 1;
-        uint64_t absolute_hard_limit = sst->max_k;
-        if (sst->max_k >= space_needed_for_rest) {
-            absolute_hard_limit = sst->max_k - space_needed_for_rest;
-        } else {
-            // 물리적으로 불가능한 상황 (이미 앞에서 걸러졌어야 함)
-            absolute_hard_limit = min_possible; 
-        }
+      // 2. Constraints: Must be strictly ascending and leave space for remaining keys
+      uint64_t min_possible = first_key_written ? (prev_key_num + 1) : sst->min_k;
+      uint64_t max_possible = sst->max_k;
+      if (sst->max_k >= (keys_remaining - 1)) {
+        max_possible = sst->max_k - (keys_remaining - 1);
+      }
 
-        // ---------------------------------------------------------------------
-        // 3. 최종 구간 확정 (Resolution)
-        // ---------------------------------------------------------------------
-        
-        // (1) Bucket Min: 이론적 위치와 최소 가능 위치 중 큰 값
-        uint64_t bucket_min = std::max(theoretical_min, min_possible);
-        
-        // (2) Bucket Max: 이론적 최대와 하드 리미트 중 작은 값
-        uint64_t bucket_max = std::min(theoretical_max, absolute_hard_limit);
+      // 3. Final selection range
+      uint64_t bucket_min = std::max(theoretical_min, min_possible);
+      uint64_t bucket_max = std::min(theoretical_max, max_possible);
 
-        // [CRITICAL FIX] 
-        // 만약 하드 리미트 때문에 Max가 Min보다 작아졌다면?
-        // -> "오름차순(Min)"이 "공간 확보(Max)"보다 우선이다.
-        // -> Max를 Min으로 끌어올린다. (이렇게 하면 나중에 공간이 부족할 수 있지만, 당장 죽지는 않음)
-        if (bucket_max < bucket_min) {
-            bucket_max = bucket_min;
-        }
-        
-        // (만약 bucket_min > absolute_hard_limit 이라면, 
-        //  이미 물리적 공간이 부족한 상태지만 Ascending을 위해 강행)
+      if (bucket_max < bucket_min) {
+        fprintf(stderr, "[S3WriteKeysToSSTFile] Warning: bucket_max < bucket_min for i=%" PRIu64 ". Adjusting bucket_max to bucket_min.\n", i);
+        bucket_max = bucket_min;
+      }
 
-        // ---------------------------------------------------------------------
-        // 4. 랜덤 선택 및 쓰기
-        // ---------------------------------------------------------------------
-        uint64_t key_num = bucket_min;
-        uint64_t bucket_size = bucket_max - bucket_min + 1;
+      // 4. Randomly select key within the bucket (exclusive max)
+      uint64_t key_num = bucket_min;
+      if (bucket_max > bucket_min) {
+        key_num += rand_gen.Next() % (bucket_max - bucket_min + 1);
+      }
 
-        if (bucket_size > 1) {
-            key_num += rand_gen.Next() % bucket_size;
-        }
-
-        // 키 생성
-        GenerateKeyFromInt(key_num, FLAGS_num, &key_slice);
-        Slice val = gen_local.Generate();
-        
-        Status s = sst_file_writer.Put(key_slice, val);
-        if (!s.ok()) {
-            fprintf(stderr, "[Error] Put failed: %s, i=%" PRIu64 ", Key=%" PRIu64 " (Prev=%" PRIu64 ")\n", 
-                    s.ToString().c_str(), i, key_num, prev_key_num);
-            return s;
-        }
-        
-        prev_key_num = key_num;
-        first_key_written = true;
-        keys_written++;
+      // 키 생성
+      GenerateKeyFromInt(key_num, FLAGS_num, &key_slice);
+      Status s = sst_file_writer.Put(key_slice, gen_local.Generate());
+      if (!s.ok()) {
+        fprintf(stderr, "[S3WriteKeysToSSTFile] Put failed: %s, i=%" PRIu64 ", Key=%" PRIu64 "\n", 
+          s.ToString().c_str(), i, key_num);
+        return s;
+      }
+      
+      prev_key_num = key_num;
+      first_key_written = true;
     }
 
     return Status::OK();
   }
-  
-  /*
-  Status S3WriteKeysToSSTFile(const SST* sst, SstFileWriter& sst_file_writer, 
-                            RandomGenerator& gen_local) {
-    uint64_t keys_per_sst = sst->num_keys;
-    uint64_t key_range = sst->max_k - sst->min_k + 1;
-
-    if (keys_per_sst == 0) {
-      return Status::InvalidArgument("Invalid SST metadata: keys_per_sst is 0");
-    }
-    
-    // [Safety] 키 개수가 물리적 범위를 초과하는 경우 방어
-    if (key_range < keys_per_sst) {
-      fprintf(stderr, "[S3WriteKeysToSSTFile] ERROR: file_num=%d key_range=%" PRIu64 " < keys_per_sst=%" PRIu64 "\n",
-              sst->file_num, key_range, keys_per_sst);
-      return Status::InvalidArgument("key_range < keys_per_sst");
-    }
-    
-      // [Fix 1] 파일 번호를 시드에 섞어서 파일마다 다른 분포 패턴 생성
-      Random64 rand_gen(*seed_base + sst->file_num);
-
-      // [Fix 2] prev_key_num 언더플로우 방지
-      // 0에서 1을 빼면 UINT64_MAX가 되므로, 별도의 초기화 값을 쓰거나 flag를 사용해야 합니다.
-      // 여기서는 루프 내에서 처리하도록 초기값을 min_k로 잡고 별도 처리합니다.
-      uint64_t prev_key_num = sst->min_k; 
-      bool first_key_written = false;
-
-      uint64_t keys_written = 0;
-
-      for (uint64_t i = 0; i < keys_per_sst; ++i) {
-          // 남은 키 개수
-          uint64_t keys_remaining = keys_per_sst - i;
-          
-          // [Fix 3] 부동소수점(long double) 제거 -> 정수 연산으로 구간 정밀 계산
-          // "전체 범위 중 i번째 키가 대략 어디쯤 있어야 하는가?"
-          // 수식: offset = (range * i) / count
-          unsigned __int128 range_mult_i = (unsigned __int128)(key_range) * i;
-          uint64_t offset_min = (uint64_t)(range_mult_i / keys_per_sst);
-          
-          unsigned __int128 range_mult_next = (unsigned __int128)(key_range) * (i + 1);
-          uint64_t offset_max = (uint64_t)(range_mult_next / keys_per_sst);
-          
-          // 이론적 배치 구간
-          uint64_t theoretical_min = sst->min_k + offset_min;
-          uint64_t theoretical_max = sst->min_k + offset_max;
-          if (theoretical_max > sst->max_k) theoretical_max = sst->max_k;
-
-          // [Fix 4] 단조 증가(Monotonic Increase) 보장 및 Hard Limit 설정
-          // 이전 키 바로 다음 값(prev + 1)이 최소한의 시작점
-          uint64_t min_possible = first_key_written ? (prev_key_num + 1) : sst->min_k;
-
-          // 뒤에 남은 키들을 위해 반드시 남겨둬야 하는 공간 계산 (Greedy 방지)
-          // 예: Range 끝이 100이고 남은 키가 5개면, 현재 키는 95를 넘으면 안 됨.
-          uint64_t absolute_hard_limit = sst->max_k - (keys_remaining - 1);
-          
-          // 실제 버킷 범위 결정
-          uint64_t bucket_min = std::max(min_possible, theoretical_min);
-          uint64_t bucket_max = std::min(theoretical_max, absolute_hard_limit);
-
-          // 보정: 이론적 범위가 틀어졌을 때 안전장치
-          if (bucket_min > absolute_hard_limit) bucket_min = absolute_hard_limit;
-          if (bucket_max < bucket_min) bucket_max = bucket_min;
-
-          // 버킷 내에서 랜덤 선택
-          uint64_t key_num = bucket_min;
-          uint64_t bucket_size = bucket_max - bucket_min + 1;
-
-          if (bucket_size > 1) {
-              // 1개 이상의 공간이 있으면 랜덤 오프셋 적용
-              uint64_t offset = rand_gen.Next() % bucket_size;
-              key_num += offset;
-          }
-
-          // 최종 키 생성 및 쓰기
-          std::unique_ptr<const char[]> key_guard;
-          Slice key = AllocateKey(&key_guard);
-          GenerateKeyFromInt(key_num, FLAGS_num, &key);
-          Slice val = gen_local.Generate();
-      
-          Status s = sst_file_writer.Put(key, val);
-          
-          if (!s.ok()) {
-            fprintf(stderr, "[S3WriteKeysToSSTFile] ERROR: file_num=%d failed at i=%" PRIu64 "/%" PRIu64 ": %s\n",
-                    sst->file_num, i, keys_per_sst, s.ToString().c_str());
-            return s;
-          }
-          
-          prev_key_num = key_num;
-          first_key_written = true;
-          keys_written++;
-      }
-      
-      // [Safety Check] 의도한 개수만큼 다 썼는지 확인
-      if (keys_written != keys_per_sst) {
-          fprintf(stderr, "[S3WriteKeysToSSTFile] WARNING: Expected %" PRIu64 " keys but wrote %" PRIu64 " (Range: [%" PRIu64 ", %" PRIu64 "])\n",
-                  keys_per_sst, keys_written, sst->min_k, sst->max_k);
-      }
-
-      return Status::OK();
-  }
-  */
 
   void S3DoWriteSST([[maybe_unused]]ThreadState* thread, [[maybe_unused]]WriteMode write_mode) {
-    // The ttload workload uses internal parallelism (tt_threads) to handle
-    // the LSM tree reconstruction. Since global state and ingestion order
-    // must be managed by a single coordinator, we enforce FLAGS_threads == 1.
     if (FLAGS_threads > 1) {
       fprintf(stderr, "ERROR: ttload workload requires --threads=1. "
                       "Use --tt_threads for internal parallelism.\n");
@@ -5657,7 +5504,6 @@ class Benchmark {
     int64_t stage = 0;
     size_t id = 0;
 
-    // Create a new Column Family for the ttload run if the database is open.
     if (db_.db != nullptr) {
       db_.CreateNewCf(open_options_, stage);
     }
@@ -5665,8 +5511,7 @@ class Benchmark {
     
     //========================= Phase 1 =========================//
     // Phase1. Read level stats from CSV
-    const std::string csv_path = FLAGS_csv_path;
-    std::vector<LevelStats> levels = LevelStatsFromCsv(csv_path);
+    std::vector<LevelStats> levels = LevelStatsFromCsv(FLAGS_csv_path);
 
     std::string output_dir = FLAGS_db;
     while (!output_dir.empty() && output_dir.back() == '/') {
@@ -5683,7 +5528,6 @@ class Benchmark {
 
     for (size_t i = 0; i < levels.size(); ++i) {
       all_levels_ssts[i] = MakeSSTsFromLevel(levels[i], output_dir);
-      
       for (auto& sst : all_levels_ssts[i]) {
         flat_task_list.push_back(&sst);
       }
@@ -5696,11 +5540,9 @@ class Benchmark {
     //========================= Phase 3 =========================//
     // Phase 3. Parallel SST generation using thread pool
     ThreadPool* thread_pool = GetS3ThreadPool();
-    
     std::atomic<size_t> pending_jobs(flat_task_list.size());
     std::mutex done_mutex;
     std::condition_variable done_cv;
-    
     std::atomic<int> success_count(0);
     std::atomic<int> fail_count(0);
     
@@ -5710,7 +5552,6 @@ class Benchmark {
         // Local copies for thread safety.
         RandomGenerator gen_local;
         Options options_local = options;
-        
         std::string sst_path = sst_ptr->out_path;
         Status s = Status::OK();
 
@@ -5722,36 +5563,12 @@ class Benchmark {
           env_opts.use_direct_reads = true;
           
           SstFileWriter sst_file_writer(env_opts, options_local);
-          
-          // Open file
           s = sst_file_writer.Open(sst_path);
-          if (!s.ok()) {
-             fprintf(stderr, "[DEBUG_FAIL] Open failed for %s: %s\n", 
-                     sst_path.c_str(), s.ToString().c_str());
-          }
-
           if (s.ok()) {
-            // Key generation and writing (heaviest task)
             s = S3WriteKeysToSSTFile(sst_ptr, sst_file_writer, gen_local);
-            
-            if (!s.ok()) {
-               fprintf(stderr, "[DEBUG_FAIL] WriteKeys failed for %s: %s\n"
-                               "  -> Meta: Keys=%" PRIu64 ", Range=[%" PRIu64 ", %" PRIu64 "]\n",
-                       sst_path.c_str(), s.ToString().c_str(), 
-                       sst_ptr->num_keys, sst_ptr->min_k, sst_ptr->max_k);
-            }
           }
-          
           if (s.ok()) {
-            // Metadata finalization and closing
             s = sst_file_writer.Finish();
-            
-            if (!s.ok()) {
-               fprintf(stderr, "[DEBUG_FAIL] Finish failed for %s: %s (Did S3WriteKeysToSSTFile write 0 keys?)\n", 
-                       sst_path.c_str(), s.ToString().c_str());
-              fprintf(stderr, "  -> Meta: Keys=%" PRIu64 ", Range=[%" PRIu64 ", %" PRIu64 "]\n",
-                      sst_ptr->num_keys, sst_ptr->min_k, sst_ptr->max_k);
-            }
           }
         }
 
@@ -5763,7 +5580,6 @@ class Benchmark {
                   sst_path.c_str(), s.ToString().c_str());
         }
 
-        // Check and notify job completion
         if (--pending_jobs == 0) {
           std::lock_guard<std::mutex> lock(done_mutex);
           done_cv.notify_one();
@@ -5793,11 +5609,9 @@ class Benchmark {
     //========================= Phase 4 =========================//
     // Phase 4. Level-wise ingestion with dependency management
     const size_t kBatchSize = 16;
-
     for (int i = static_cast<int>(levels.size()) - 1; i >= 0; --i) {
       const auto& lvl_stats = levels[i];
       const auto& ssts = all_levels_ssts[i];
-      
       if (ssts.empty()) continue;
 
       size_t total_files = ssts.size();
@@ -5818,7 +5632,6 @@ class Benchmark {
       for (size_t b = 0; b < num_batches; ++b) {
         size_t start_idx = b * kBatchSize;
         size_t end_idx = std::min(start_idx + kBatchSize, total_files);
-        
         std::vector<std::string> batch_paths;
         batch_paths.reserve(end_idx - start_idx);
         
@@ -5826,40 +5639,34 @@ class Benchmark {
           batch_paths.push_back(ssts[k].out_path);
         }
 
-        // 람다 캡처에서도 변경된 변수명 사용
-        thread_pool->SubmitJob([&, batch_paths, ifo_local]() {
+        thread_pool->SubmitJob([&, batch_paths, ifo_local, b, level = lvl_stats.level]() {
           Status s = db_with_cfh->db->IngestExternalFile(batch_paths, ifo_local);
-          
           if (!s.ok()) {
             fprintf(stderr, "[S3DoWriteSST] ERROR: Ingest failed for Level %d (Batch %zu): %s\n", 
-                    lvl_stats.level, b, s.ToString().c_str());
-            ingest_fail_count++; // [수정]
+                    level, b, s.ToString().c_str());
+            ingest_fail_count++;
           }
-
-          if (--ingest_pending_jobs == 0) { // [수정]
-            std::lock_guard<std::mutex> lock(ingest_mutex); // [수정]
-            ingest_cv.notify_one(); // [수정]
+          if (--ingest_pending_jobs == 0) {
+            std::lock_guard<std::mutex> lock(ingest_mutex);
+            ingest_cv.notify_one();
           }
         });
       }
 
-      // 대기 로직 수정
       {
-        std::unique_lock<std::mutex> lock(ingest_mutex); // [수정]
-        ingest_cv.wait(lock, [&] { return ingest_pending_jobs.load() == 0; }); // [수정]
+        std::unique_lock<std::mutex> lock(ingest_mutex);
+        ingest_cv.wait(lock, [&] { return ingest_pending_jobs.load() == 0; });
       }
 
-      if (ingest_fail_count > 0) { // [수정]
+      if (ingest_fail_count > 0) {
         fprintf(stderr, "[S3DoWriteSST] WARNING: Level %d had %d batch failures.\n", 
                 lvl_stats.level, ingest_fail_count.load());
       }
     }
-    //==============================================================//
 
-    // Final sync to ensure all ingestion jobs are done.
     thread_pool->WaitForJobsAndJoinAllThreads();
-    fprintf(stdout, "[S3DoWriteSST] All workloads completed.\n");
-}
+    //==============================================================//
+  }
 
   void WriteUniqueRandom(ThreadState* thread) {
     DoWrite(thread, UNIQUE_RANDOM);
